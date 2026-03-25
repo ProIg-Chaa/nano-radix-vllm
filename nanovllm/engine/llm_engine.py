@@ -62,6 +62,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        self.scheduler.block_manager.reset_stats()
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
@@ -90,4 +91,16 @@ class LLMEngine:
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
+        stats = self.scheduler.block_manager.get_stats()
+        print(
+            "[prefix-cache] "
+            f"alloc_reqs={stats['alloc_requests']} "
+            f"dealloc_reqs={stats['dealloc_requests']} "
+            f"queried_blocks={stats['queried_blocks']} "
+            f"hit_blocks={stats['hit_blocks']} "
+            f"miss_blocks={stats['miss_blocks']} "
+            f"hit_rate={stats['hit_rate']:.2%} "
+            f"reused_tokens={stats['reused_tokens']} "
+            f"new_blocks={stats['new_blocks']}"
+        )
         return outputs
