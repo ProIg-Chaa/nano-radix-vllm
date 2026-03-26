@@ -314,3 +314,191 @@ This matched the previous expected behavior exactly, confirming that the schedul
 
 ### Recommended Next Step
 Phase 4 should improve the prefix index itself, most likely by evolving `PrefixCache` beyond the current chained-hash lookup into a structure that is easier to extend toward radix-tree-style prefix matching.
+
+
+## Phase 4 - Evolve PrefixCache Into a Block-Level Prefix Tree
+
+### Objective
+Replace the current flat chained-hash prefix index with a tree-shaped block-prefix structure, while preserving the current block-level reuse semantics and the Phase 3 scheduling flow.
+
+### File Changed
+- `nanovllm/engine/block_manager.py`
+
+### Problem Before This Step
+After Phase 3, the scheduler already used a prefix-aware planning step, but the prefix index itself was still logically flat:
+- prefix lookup still depended on chained hash lookup
+- future extension toward radix-style structure was not yet represented directly in the data structure
+
+So the control flow had become "match first, allocate second", but the prefix cache itself had not yet become tree-shaped.
+
+### Main Design Change
+Introduced a block-level prefix tree inside `PrefixCache`.
+
+#### New structure
+Added `PrefixTreeNode` with:
+- `block_id`
+- `block_hash`
+- `token_ids`
+- `children`
+
+The cache now has a root node and stores full-block prefixes by walking parent -> child edges keyed by full block token tuples.
+
+### How Lookup Works Now
+For each full prompt block:
+- start from the current prefix node
+- use the block token tuple as the child key
+- if that child exists, the corresponding cached block can be considered for reuse
+- if it does not exist, the prefix path ends there
+
+This makes the logical prefix structure explicit rather than implicit in a flat hash dictionary.
+
+### How Commit Works Now
+When a block becomes committable:
+- find or create the child node under the current prefix node
+- update that node with the latest `block_id` and `block_hash`
+- store the block tokens on the node
+- keep the old `hash_to_block_id` flat mapping as a compatibility/debugging view
+
+So after this step:
+- the tree is the source of truth for prefix traversal
+- the flat hash map is retained as a compatibility mirror
+
+### Why This Matters
+This is the first step where the prefix cache data structure itself becomes structurally closer to a radix-style cache.
+
+It is still block-granular and not yet a full SGLang-style radix tree, but it changes the representation from:
+- flat mapping over chained hashes
+
+to:
+- explicit prefix path over block tokens
+
+That makes later work easier in several ways:
+- longest-prefix-style traversal becomes more natural
+- prefix state is now attached to a path, not just a flat key
+- future node-level policies such as eviction metadata or subtree statistics become easier to add
+
+### Important Constraint
+This phase still intentionally preserves current semantics:
+- only full blocks enter the tree
+- partial tail blocks are still not reusable
+- once a miss occurs inside a request, later blocks are still treated as misses for the current implementation path
+- scheduler interface and prefill plan interface stay unchanged
+
+So this is still an intermediate architectural step, not yet full radix attention.
+
+### Validation After Phase 4
+Ran the shared-prefix small regression test.
+Observed log:
+- `logs/experiments/prefix_cache_test_small_20260326_172607.log`
+
+Observed stats:
+
+```text
+[prefix-cache] alloc_reqs=4 dealloc_reqs=4 queried_blocks=16 hit_blocks=9 miss_blocks=7 hit_rate=56.25% reused_tokens=2304 new_blocks=7
+```
+
+This matched the previous expected result exactly, showing that the tree-based prefix cache preserves the existing block-level behavior.
+
+### What Was Learned From Phase 4
+1. The control flow and the prefix data structure are now aligned: both are prefix-aware.
+2. The cache has moved from an implicit prefix representation to an explicit path representation.
+3. The project is now materially closer to radix-style evolution, even though the granularity is still full block rather than arbitrary token spans.
+
+### Recommended Next Step
+Phase 5 should decide whether to continue in one of two directions:
+- enhance the tree with richer node metadata and eventual eviction/pinning policy
+- reduce the logical reuse granularity beyond full blocks, which would require a more substantial change to addressing and cache representation
+
+
+## Phase 5 - Make The Prefix Tree Ownership-Safe
+
+### Objective
+Make the block-level prefix tree safer to maintain by ensuring each physical `block_id` has a single authoritative owner node in the tree, and by pruning stale subtrees when a block is reused for a different prefix path.
+
+### File Changed
+- `nanovllm/engine/block_manager.py`
+
+### Problem Before This Step
+After Phase 4, the cache had an explicit tree structure, but it still had a correctness/maintenance risk:
+- when a free block was later reused for a different prefix path
+- the old tree node could still keep pointing to that same `block_id`
+- deeper descendants under that stale node could remain in the tree even though the path was no longer valid
+
+The runtime lookup was still guarded by token equality checks, so many stale cases would degrade into cache misses rather than silent wrong reuse.
+However, the tree would gradually accumulate outdated ownership relationships, making future eviction or policy logic harder and less trustworthy.
+
+### Main Design Change
+Added ownership and maintenance metadata to `PrefixTreeNode` and `PrefixCache`.
+
+#### New node metadata
+`PrefixTreeNode` now records:
+- `parent`
+- `key_from_parent`
+- `depth`
+- `touch_count`
+- `last_access_tick`
+
+This turns the tree into a structure with explicit parent/child identity and access history, rather than only forward child edges.
+
+#### New cache metadata
+`PrefixCache` now tracks:
+- `block_to_node`: reverse mapping from physical `block_id` to its owning tree node
+- `access_tick`: monotonic counter for node touch history
+
+### New Safety Rule
+A physical cache block may only have **one** authoritative owner node in the prefix tree at a time.
+
+When `commit()` assigns a block to a node:
+- look up whether that block id already belongs to another node
+- if so, and it is not the same node, prune the old subtree first
+- then bind the block to the new node
+
+This guarantees that the tree does not keep multiple conflicting prefix paths attached to the same physical block id.
+
+### Subtree Pruning
+Added `_prune_subtree()` which recursively:
+- removes descendant ownership information
+- removes flat hash mirror entries when they still point to the stale node
+- removes reverse block ownership entries
+- detaches the subtree from its parent
+
+This is important because if an internal block in a prefix path becomes invalid, the descendants under that path are no longer semantically usable either.
+
+### Why This Matters
+This phase does not change current hit-rate semantics, but it makes the tree structurally trustworthy for later work.
+
+Without this step, later features such as:
+- node-level eviction metadata
+- subtree-based policies
+- radix-style maintenance logic
+would be built on top of a tree that can retain stale ownership history.
+
+After this step, the prefix tree is no longer just explicit; it is also ownership-safe.
+
+### Additional Benefit
+The new metadata also gives the project a place to hang future policies:
+- `touch_count` and `last_access_tick` can later support cache retention / recency heuristics
+- `parent` and `depth` make subtree operations and ancestor-aware policies easier
+
+### Validation After Phase 5
+Re-ran the shared-prefix small regression test.
+Observed log:
+- `logs/experiments/prefix_cache_test_small_20260326_190538.log`
+
+Observed stats:
+
+```text
+[prefix-cache] alloc_reqs=4 dealloc_reqs=4 queried_blocks=16 hit_blocks=9 miss_blocks=7 hit_rate=56.25% reused_tokens=2304 new_blocks=7
+```
+
+This matched the expected block-level behavior exactly, confirming that ownership-safe tree maintenance did not change the current reuse semantics.
+
+### What Was Learned From Phase 5
+1. Explicit prefix structure is not enough; ownership consistency also matters.
+2. Guarding correctness only at lookup time is not sufficient if the goal is to evolve the cache into a richer tree-managed system.
+3. Reverse ownership and subtree pruning are natural prerequisites for later eviction or retention policy work.
+
+### Recommended Next Step
+Phase 6 should choose between two directions:
+- add an actual node-level retention / eviction policy using the metadata added in Phase 5
+- start attacking the bigger architectural gap: reuse granularity finer than full blocks

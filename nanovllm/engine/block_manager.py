@@ -1,5 +1,5 @@
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import xxhash
 import numpy as np
@@ -67,11 +67,27 @@ class KVBlockAllocator:
             self.free_block_ids.append(block_id)
 
 
+@dataclass
+class PrefixTreeNode:
+    parent: "PrefixTreeNode | None" = None
+    key_from_parent: tuple[int, ...] = ()
+    depth: int = 0
+    block_id: int = -1
+    block_hash: int = -1
+    token_ids: tuple[int, ...] = ()
+    touch_count: int = 0
+    last_access_tick: int = 0
+    children: dict[tuple[int, ...], "PrefixTreeNode"] = field(default_factory=dict)
+
+
 class PrefixCache:
 
     def __init__(self, block_size: int):
         self.block_size = block_size
+        self.root = PrefixTreeNode()
         self.hash_to_block_id: dict[int, int] = dict()
+        self.block_to_node: dict[int, PrefixTreeNode] = dict()
+        self.access_tick = 0
 
     @staticmethod
     def compute_hash(token_ids: list[int], prefix: int = -1):
@@ -84,15 +100,59 @@ class PrefixCache:
     def compute_block_hash(self, token_ids: list[int], prefix: int = -1) -> int:
         return self.compute_hash(token_ids, prefix) if len(token_ids) == self.block_size else -1
 
-    def lookup(self, token_ids: list[int], prefix: int = -1) -> tuple[int, int]:
-        block_hash = self.compute_block_hash(token_ids, prefix)
-        return block_hash, self.hash_to_block_id.get(block_hash, -1)
+    def _touch(self, node: PrefixTreeNode):
+        self.access_tick += 1
+        node.last_access_tick = self.access_tick
+        node.touch_count += 1
 
-    def commit(self, block: Block, block_hash: int, token_ids: list[int]):
+    def get_child(self, parent: PrefixTreeNode, token_ids: list[int]) -> PrefixTreeNode | None:
+        if len(token_ids) != self.block_size:
+            return None
+        node = parent.children.get(tuple(token_ids))
+        if node is not None:
+            self._touch(node)
+        return node
+
+    def _prune_subtree(self, node: PrefixTreeNode):
+        for child in list(node.children.values()):
+            self._prune_subtree(child)
+        if node.block_hash != -1 and self.hash_to_block_id.get(node.block_hash) == node.block_id:
+            del self.hash_to_block_id[node.block_hash]
+        if node.block_id != -1 and self.block_to_node.get(node.block_id) is node:
+            del self.block_to_node[node.block_id]
+        node.children.clear()
+        node.block_id = -1
+        node.block_hash = -1
+        node.token_ids = ()
+        node.touch_count = 0
+        node.last_access_tick = 0
+        if node.parent is not None:
+            node.parent.children.pop(node.key_from_parent, None)
+
+    def _ensure_node(self, parent: PrefixTreeNode, token_ids: list[int]) -> PrefixTreeNode:
+        key = tuple(token_ids)
+        node = parent.children.get(key)
+        if node is None:
+            node = PrefixTreeNode(parent=parent, key_from_parent=key, depth=parent.depth + 1)
+            parent.children[key] = node
+        return node
+
+    def commit(self, parent: PrefixTreeNode, block: Block, block_hash: int, token_ids: list[int]) -> PrefixTreeNode:
         if block_hash == -1:
-            return
+            return self.root
+        node = self._ensure_node(parent, token_ids)
+        old_owner = self.block_to_node.get(block.block_id)
+        if old_owner is not None and old_owner is not node:
+            self._prune_subtree(old_owner)
+            node = self._ensure_node(parent, token_ids)
+        node.block_id = block.block_id
+        node.block_hash = block_hash
+        node.token_ids = tuple(token_ids)
+        self._touch(node)
         block.update(block_hash, token_ids)
         self.hash_to_block_id[block_hash] = block.block_id
+        self.block_to_node[block.block_id] = node
+        return node
 
 
 class PlanStepKind(Enum):
@@ -153,14 +213,17 @@ class BlockManager:
     def make_prefill_plan(self, seq: Sequence) -> PrefillPlan:
         steps = []
         prefix_hash = -1
+        prefix_node = self.prefix_cache.root
         cache_miss = False
         cached_tokens = 0
         required_free_blocks = 0
 
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            block_hash, block_id = self.prefix_cache.lookup(token_ids, prefix_hash)
-            is_hit = block_id != -1 and not cache_miss and self.blocks[block_id].token_ids == token_ids
+            block_hash = self.prefix_cache.compute_block_hash(token_ids, prefix_hash)
+            node = None if cache_miss else self.prefix_cache.get_child(prefix_node, token_ids)
+            block_id = -1 if node is None else node.block_id
+            is_hit = block_id != -1 and self.blocks[block_id].token_ids == token_ids
             if is_hit:
                 cached_tokens += self.block_size
                 if self.allocator.is_used(block_id):
@@ -168,6 +231,7 @@ class BlockManager:
                 else:
                     required_free_blocks += 1
                     steps.append(PlanStep(PlanStepKind.HIT_FREE, block_id, block_hash, token_ids))
+                prefix_node = node
             else:
                 cache_miss = True
                 required_free_blocks += 1
@@ -188,6 +252,7 @@ class BlockManager:
 
         self.stats["alloc_requests"] += 1
         seq.num_cached_tokens = plan.cached_tokens
+        prefix_node = self.prefix_cache.root
 
         for step in plan.steps:
             self.stats["queried_blocks"] += 1
@@ -207,7 +272,8 @@ class BlockManager:
                 block_id = step.block_id
                 block = self.allocator.allocate_block(block_id)
 
-            self.prefix_cache.commit(block, step.block_hash, token_ids)
+            if step.block_hash != -1:
+                prefix_node = self.prefix_cache.commit(prefix_node, block, step.block_hash, token_ids)
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
@@ -232,6 +298,11 @@ class BlockManager:
             token_ids = seq.block(seq.num_blocks - 1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             block_hash = self.prefix_cache.compute_block_hash(token_ids, prefix)
-            self.prefix_cache.commit(last_block, block_hash, token_ids)
+            prefix_node = self.prefix_cache.root
+            for block_id in block_table[:-1]:
+                block = self.blocks[block_id]
+                prefix_node = self.prefix_cache.get_child(prefix_node, block.token_ids)
+                assert prefix_node is not None
+            self.prefix_cache.commit(prefix_node, last_block, block_hash, token_ids)
         else:
             assert last_block.hash == -1
