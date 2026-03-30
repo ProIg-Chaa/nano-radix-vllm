@@ -596,3 +596,172 @@ Continue Stage A only far enough to make the cache manager trustworthy:
 - decide whether node pin metadata is needed explicitly
 - then move to the larger Stage B/C work: decoupling logical reuse granularity from physical block storage
 
+## Phase 7 - Begin Stage B With Logical Page Metadata
+
+### Route Choice
+After stabilizing the block-level cache manager in Stage A, the project now begins **Stage B**.
+This transition is intentionally conservative.
+The immediate goal is not yet to make partial blocks reusable.
+Instead, the first Stage B step is to introduce an explicit **logical page** axis so the system can start distinguishing:
+- physical KV storage block size
+- logical prefix reuse granularity
+
+This preserves the current execution path while preparing the codebase for later finer-grained prefix reuse.
+
+### Objective
+Add the first minimal Stage B skeleton:
+- a configurable `logical_page_size`
+- `Sequence` helpers for logical-page views
+- prefill-plan metadata that reports reuse in logical pages as well as tokens/blocks
+- observability that shows logical-page reuse without changing current runtime semantics
+
+### Files Changed
+- `nanovllm/config.py`
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/scheduler.py`
+- `nanovllm/engine/model_runner.py`
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/engine/llm_engine.py`
+
+### Main Design Change
+Introduced a new configuration field:
+- `logical_page_size`, default `32`
+
+Validation rules:
+- it must be positive
+- it must evenly divide `kvcache_block_size`
+
+This means the system now has two distinct granularities:
+- physical block size: still the KV/cache allocation unit
+- logical page size: a smaller semantic unit for future prefix matching and accounting
+
+### Sequence-Level Changes
+`Sequence` now exposes logical-page metadata and slicing helpers:
+- `logical_page_size`
+- `num_logical_pages`
+- `num_cached_logical_pages`
+- `last_logical_page_num_tokens`
+- `logical_page(i)`
+
+This is the first place where the project can talk about a request in page units without yet changing the actual KV layout.
+
+### Scheduler / Runner Alignment
+Both `Scheduler` and `ModelRunner` now push the config values back into `Sequence` class-level settings so the whole runtime sees a consistent:
+- `block_size`
+- `logical_page_size`
+
+This avoids hard-coding `256`/`32` assumptions in scattered places.
+
+### Prefill Plan Extension
+`PrefillPlan` now carries both block-oriented and logical-page-oriented metadata:
+- `cached_tokens`
+- `cached_logical_pages`
+- `required_free_blocks`
+- `required_logical_pages`
+
+Current scheduling behavior is still unchanged.
+The scheduler continues to admit work based on tokens and free blocks.
+However, the planning path now computes page-level accounting that later stages can consume.
+
+### Observability
+Prefix-cache stats now additionally report:
+- `reused_logical_pages`
+- `logical_page_size`
+
+This makes Stage B progress visible even before the runtime begins reusing partial blocks.
+
+### Why This Matters
+This phase still does **not** make partial blocks reusable.
+The actual reuse semantics are still block-level.
+But the system now has a first-class place to represent a smaller logical reuse unit.
+
+That is the critical first move for Stage B, because later changes will need to answer:
+- how many logical pages were reused
+- how many logical pages remain uncached
+- how a request maps from logical units to physical KV storage
+
+Without this intermediate layer, later addressing work would have to be introduced all at once.
+
+### Expected Validation
+Existing regression tests should continue to pass.
+The only visible difference should be extra prefix-cache fields in the output, showing logical-page accounting derived from the old block-level hits.
+
+### Recommended Next Step
+The next Stage B step should stay incremental:
+- add a request-side logical-page mapping structure
+- then let the planning path reason about page-aligned cached spans more explicitly
+- only after that begin touching the actual KV addressing path in `ModelRunner`
+
+## Phase 8 - Add Request-Side Logical Page Mapping Skeleton
+
+### Objective
+Continue Stage B without touching the actual KV addressing path yet.
+The goal of this step is to make logical pages first-class on the **request side**, so later work can reason about page-level cached spans before the runtime starts storing or addressing KV at page granularity.
+
+### Files Changed
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/block_manager.py`
+
+### Main Design Change
+Added a request-side logical-page mapping structure.
+`Sequence` now owns `logical_page_table`, where each entry records:
+- `block_id`
+- `block_offset`
+- `page_tokens`
+- `cached`
+
+This means a request can now explicitly describe how each logical page relates to the current block-level KV layout, even though the physical storage path is still block-based.
+
+### Sequence-Level Additions
+Introduced `LogicalPageRef` and new `Sequence` helpers:
+- `logical_page_table`
+- `logical_pages_per_block`
+- `clear_logical_page_table()`
+- `sync_logical_page_table()`
+
+`sync_logical_page_table()` derives the page mapping from the current:
+- `block_table`
+- `num_tokens`
+- `num_cached_tokens`
+- `logical_page_size`
+
+This gives later stages a stable request-local source of truth for page layout.
+
+### Prefill Plan Extension
+`PrefillPlan` now also carries page-level planning metadata:
+- `page_block_ids`
+- `cached_page_mask`
+
+At planning time:
+- cached full-block hits are expanded into logical-page entries that point to the reused `block_id`
+- uncached spans are represented with `-1` block ids and `False` in the page mask
+
+This is still derived from the current block-level semantics, but it makes the cached/uncached page boundary explicit.
+
+### Lifecycle Integration
+The page table is now synchronized when:
+- prefill allocation finishes
+- decode append mutates the block layout
+- deallocation clears the request state
+
+So the request-side mapping stays aligned with the current block-level runtime state.
+
+### Why This Matters
+The previous Stage B step only introduced logical-page counting.
+This step goes one level deeper: the system can now represent a request's page layout, not just count pages.
+
+That is the missing bridge between:
+- page-level planning semantics
+- and future page-level or token-level KV addressing
+
+Without a request-side mapping table, later work would have to jump directly from counters to backend layout changes.
+
+### Expected Validation
+Current block-level behavior should remain unchanged.
+Regression output may not change much beyond preserving the Stage B page statistics, because this step mainly adds internal structure for later use.
+
+### Recommended Next Step
+The next Stage B step should connect this request-side mapping to a more explicit planning abstraction:
+- reason about contiguous cached page spans instead of only block hits
+- then start threading page-layout metadata into `ModelRunner.prepare_prefill()` as read-only structure before changing the actual KV storage layout
+

@@ -1,4 +1,5 @@
 from copy import copy
+from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 
@@ -11,8 +12,17 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+@dataclass
+class LogicalPageRef:
+    block_id: int
+    block_offset: int
+    page_tokens: int
+    cached: bool
+
+
 class Sequence:
     block_size = 256
+    logical_page_size = 32
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
@@ -24,6 +34,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table = []
+        self.logical_page_table: list[LogicalPageRef] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -62,14 +73,52 @@ class Sequence:
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
+    @property
+    def num_cached_logical_pages(self):
+        return self.num_cached_tokens // self.logical_page_size
+
+    @property
+    def num_logical_pages(self):
+        return (self.num_tokens + self.logical_page_size - 1) // self.logical_page_size
+
+    @property
+    def last_logical_page_num_tokens(self):
+        return self.num_tokens - (self.num_logical_pages - 1) * self.logical_page_size
+
+    @property
+    def logical_pages_per_block(self):
+        return self.block_size // self.logical_page_size
+
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
+
+    def logical_page(self, i):
+        assert 0 <= i < self.num_logical_pages
+        return self.token_ids[i*self.logical_page_size: (i+1)*self.logical_page_size]
+
+    def clear_logical_page_table(self):
+        self.logical_page_table.clear()
+
+    def sync_logical_page_table(self, cached_tokens: int | None = None):
+        cached_tokens = self.num_cached_tokens if cached_tokens is None else cached_tokens
+        logical_page_table = []
+        for page_idx in range(self.num_logical_pages):
+            page_start = page_idx * self.logical_page_size
+            block_idx = page_start // self.block_size
+            block_offset = page_start % self.block_size
+            block_id = self.block_table[block_idx] if block_idx < len(self.block_table) else -1
+            page_tokens = min(self.logical_page_size, self.num_tokens - page_start)
+            cached = page_start + page_tokens <= cached_tokens
+            logical_page_table.append(LogicalPageRef(block_id, block_offset, page_tokens, cached))
+        self.logical_page_table = logical_page_table
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        if self.block_table:
+            self.sync_logical_page_table()
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
@@ -77,6 +126,7 @@ class Sequence:
 
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.logical_page_table = []
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

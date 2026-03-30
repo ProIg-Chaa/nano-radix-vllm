@@ -101,6 +101,8 @@ class LLMEngine:
             f"miss_blocks={stats['miss_blocks']} "
             f"hit_rate={stats['hit_rate']:.2%} "
             f"reused_tokens={stats['reused_tokens']} "
+            f"reused_logical_pages={stats['reused_logical_pages']} "
+            f"logical_page_size={stats['logical_page_size']} "
             f"new_blocks={stats['new_blocks']} "
             f"eviction_passes={stats['eviction_passes']} "
             f"evicted_leaves={stats['evicted_leaves']}"

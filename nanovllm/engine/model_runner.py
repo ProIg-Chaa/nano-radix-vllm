@@ -17,6 +17,8 @@ class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
+        Sequence.block_size = config.kvcache_block_size
+        Sequence.logical_page_size = config.logical_page_size
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size

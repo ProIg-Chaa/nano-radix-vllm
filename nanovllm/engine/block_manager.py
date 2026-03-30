@@ -225,13 +225,19 @@ class PlanStep:
 class PrefillPlan:
     steps: list[PlanStep]
     cached_tokens: int
+    cached_logical_pages: int
     required_free_blocks: int
+    required_logical_pages: int
+    page_block_ids: list[int]
+    cached_page_mask: list[bool]
 
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, logical_page_size: int | None = None):
         self.block_size = block_size
+        self.logical_page_size = block_size if logical_page_size is None else logical_page_size
+        assert self.block_size % self.logical_page_size == 0
         self.allocator = KVBlockAllocator(num_blocks)
         self.prefix_cache = PrefixCache(block_size)
         self.blocks = self.allocator.blocks
@@ -246,6 +252,7 @@ class BlockManager:
             "hit_blocks": 0,
             "miss_blocks": 0,
             "reused_tokens": 0,
+            "reused_logical_pages": 0,
             "new_blocks": 0,
             "eviction_passes": 0,
             "evicted_leaves": 0,
@@ -259,6 +266,7 @@ class BlockManager:
         stats = dict(self.stats)
         queried_blocks = stats["queried_blocks"]
         stats["hit_rate"] = stats["hit_blocks"] / queried_blocks if queried_blocks else 0.0
+        stats["logical_page_size"] = self.logical_page_size
         return stats
 
     @classmethod
@@ -272,6 +280,8 @@ class BlockManager:
         cache_miss = False
         cached_tokens = 0
         required_free_blocks = 0
+        page_block_ids = []
+        cached_page_mask = []
 
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
@@ -279,6 +289,7 @@ class BlockManager:
             node = None if cache_miss else self.prefix_cache.get_child(prefix_node, token_ids)
             block_id = -1 if node is None else node.block_id
             is_hit = block_id != -1 and self.blocks[block_id].token_ids == token_ids
+            num_pages = (len(token_ids) + self.logical_page_size - 1) // self.logical_page_size
             if is_hit:
                 cached_tokens += self.block_size
                 if self.allocator.is_used(block_id):
@@ -286,14 +297,31 @@ class BlockManager:
                 else:
                     required_free_blocks += 1
                     steps.append(PlanStep(PlanStepKind.HIT_FREE, block_id, block_hash, token_ids))
+                page_block_ids.extend([block_id] * num_pages)
+                cached_page_mask.extend([True] * num_pages)
                 prefix_node = node
             else:
                 cache_miss = True
                 required_free_blocks += 1
                 steps.append(PlanStep(PlanStepKind.MISS, -1, block_hash, token_ids))
+                page_block_ids.extend([-1] * num_pages)
+                cached_page_mask.extend([False] * num_pages)
             prefix_hash = block_hash
 
-        return PrefillPlan(steps, cached_tokens, required_free_blocks)
+        uncached_tokens = len(seq) - cached_tokens
+        cached_logical_pages = cached_tokens // self.logical_page_size
+        required_logical_pages = (uncached_tokens + self.logical_page_size - 1) // self.logical_page_size
+        assert len(page_block_ids) == seq.num_logical_pages
+        assert len(cached_page_mask) == seq.num_logical_pages
+        return PrefillPlan(
+            steps,
+            cached_tokens,
+            cached_logical_pages,
+            required_free_blocks,
+            required_logical_pages,
+            page_block_ids,
+            cached_page_mask,
+        )
 
     def can_allocate(self, seq: Sequence, plan: PrefillPlan | None = None) -> bool:
         if plan is None:
@@ -341,17 +369,20 @@ class BlockManager:
             elif step.kind == PlanStepKind.HIT_USED:
                 self.stats["hit_blocks"] += 1
                 self.stats["reused_tokens"] += self.block_size
+                self.stats["reused_logical_pages"] += self.block_size // self.logical_page_size
                 block_id = step.block_id
                 block = self.allocator.incref(block_id)
             else:
                 self.stats["hit_blocks"] += 1
                 self.stats["reused_tokens"] += self.block_size
+                self.stats["reused_logical_pages"] += self.block_size // self.logical_page_size
                 block_id = step.block_id
                 block = self.allocator.allocate_block(block_id)
 
             if step.block_hash != -1:
                 prefix_node = self.prefix_cache.commit(prefix_node, block, step.block_hash, token_ids)
             seq.block_table.append(block_id)
+        seq.sync_logical_page_table()
 
     def deallocate(self, seq: Sequence):
         self.stats["dealloc_requests"] += 1
@@ -359,6 +390,7 @@ class BlockManager:
             self.allocator.decref(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.clear_logical_page_table()
 
     def can_append(self, seq: Sequence) -> bool:
         return self.allocator.has_free_blocks(len(seq) % self.block_size == 1)
@@ -384,3 +416,4 @@ class BlockManager:
             self.prefix_cache.commit(prefix_node, last_block, block_hash, token_ids)
         else:
             assert last_block.hash == -1
+        seq.sync_logical_page_table()
