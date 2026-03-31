@@ -42,6 +42,9 @@ def validate_allocated_seq(seq, plan):
     assert layout.cached_page_spans == plan.cached_page_spans
     assert layout.uncached_page_spans == plan.uncached_page_spans
     assert layout.cached_page_mask == plan.cached_page_mask
+    assert layout.page_cached_tokens == plan.page_cached_tokens
+    assert sum(layout.page_cached_tokens) == plan.cached_tokens
+    assert all(page_cached_tokens in (0, PAGE_SIZE) for page_cached_tokens in layout.page_cached_tokens[:-1])
     assert sum(span.slot_end - span.slot_start for span in layout.cached_physical_spans) == plan.cached_tokens
     assert sum(span.slot_end - span.slot_start for span in layout.uncached_physical_spans) == plan.uncached_num_tokens
     if layout.cached_physical_spans:
@@ -50,7 +53,13 @@ def validate_allocated_seq(seq, plan):
     if layout.uncached_physical_spans:
         assert layout.uncached_physical_spans[0].start_token == plan.uncached_start_token
         assert layout.uncached_physical_spans[-1].end_token == len(seq)
-    assert build_page_aware_prefill_slot_mapping(seq, BLOCK_SIZE) == build_legacy_prefill_slot_mapping(seq, BLOCK_SIZE)
+    page_aware_slot_mapping = build_page_aware_prefill_slot_mapping(seq, BLOCK_SIZE)
+    legacy_slot_mapping = build_legacy_prefill_slot_mapping(seq, BLOCK_SIZE)
+    assert len(page_aware_slot_mapping) == plan.uncached_num_tokens
+    if plan.uncached_start_token % BLOCK_SIZE == 0:
+        assert page_aware_slot_mapping == legacy_slot_mapping
+    else:
+        assert len(page_aware_slot_mapping) < len(legacy_slot_mapping)
 
 
 def run_case(name, first_prompt, second_prompt=None, expected_cached_tokens=None):
@@ -99,10 +108,10 @@ cases.append(run_case(
 ))
 common_nonaligned = [77] * 600
 cases.append(run_case(
-    "nonaligned_prefix_still_block_only",
+    "nonaligned_prefix_partial_tail_reuse",
     common_nonaligned + [1, 2],
     common_nonaligned + [3, 4],
-    expected_cached_tokens=512,
+    expected_cached_tokens=600,
 ))
 common_full = [55] * 768
 cases.append(run_case(

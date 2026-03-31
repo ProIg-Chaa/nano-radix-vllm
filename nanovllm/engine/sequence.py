@@ -17,7 +17,19 @@ class LogicalPageRef:
     block_id: int
     block_offset: int
     page_tokens: int
-    cached: bool
+    cached_tokens: int
+
+    @property
+    def cached(self) -> bool:
+        return self.cached_tokens == self.page_tokens
+
+    @property
+    def uncached_tokens(self) -> int:
+        return self.page_tokens - self.cached_tokens
+
+    @property
+    def is_partial(self) -> bool:
+        return 0 < self.cached_tokens < self.page_tokens
 
 
 @dataclass
@@ -44,6 +56,7 @@ class PhysicalAddressSpan:
 class RequestPrefillLayout:
     page_block_ids: list[int]
     cached_page_mask: list[bool]
+    page_cached_tokens: list[int]
     cached_page_spans: list[LogicalPageSpan]
     uncached_page_spans: list[LogicalPageSpan]
     cached_physical_spans: list[PhysicalAddressSpan]
@@ -151,34 +164,32 @@ class Sequence:
             block_offset = page_start % self.block_size
             block_id = self.block_table[block_idx] if block_idx < len(self.block_table) else -1
             page_tokens = min(self.logical_page_size, self.num_tokens - page_start)
-            cached = page_start + page_tokens <= cached_tokens
-            logical_page_table.append(LogicalPageRef(block_id, block_offset, page_tokens, cached))
+            page_cached_tokens = min(max(cached_tokens - page_start, 0), page_tokens)
+            logical_page_table.append(LogicalPageRef(block_id, block_offset, page_tokens, page_cached_tokens))
         self.logical_page_table = logical_page_table
 
     def logical_page_spans(self, cached: bool | None = None) -> list[LogicalPageSpan]:
-        if not self.logical_page_table:
+        if self.num_tokens == 0:
             return []
         spans = []
-        start_page = 0
-        current_cached = self.logical_page_table[0].cached
-        for page_idx, page_ref in enumerate(self.logical_page_table[1:], start=1):
-            if page_ref.cached != current_cached:
-                spans.append(LogicalPageSpan(
-                    start_page,
-                    page_idx,
-                    start_page * self.logical_page_size,
-                    min(page_idx * self.logical_page_size, self.num_tokens),
-                    current_cached,
-                ))
-                start_page = page_idx
-                current_cached = page_ref.cached
-        spans.append(LogicalPageSpan(
-            start_page,
-            len(self.logical_page_table),
-            start_page * self.logical_page_size,
-            self.num_tokens,
-            current_cached,
-        ))
+        if self.num_cached_tokens > 0:
+            cached_end_page = (self.num_cached_tokens + self.logical_page_size - 1) // self.logical_page_size
+            spans.append(LogicalPageSpan(
+                0,
+                cached_end_page,
+                0,
+                self.num_cached_tokens,
+                True,
+            ))
+        if self.num_cached_tokens < self.num_tokens:
+            uncached_start_page = self.num_cached_tokens // self.logical_page_size
+            spans.append(LogicalPageSpan(
+                uncached_start_page,
+                self.num_logical_pages,
+                self.num_cached_tokens,
+                self.num_tokens,
+                False,
+            ))
         if cached is None:
             return spans
         return [span for span in spans if span.cached is cached]
@@ -187,46 +198,52 @@ class Sequence:
         if not self.logical_page_table:
             return []
         spans = []
-        start_page = 0
-        first_page = self.logical_page_table[0]
-        current_cached = first_page.cached
-        current_slot_start = first_page.block_id * self.block_size + first_page.block_offset
-        current_slot_end = current_slot_start + first_page.page_tokens
-        current_end_page = 1
-        current_end_token = min(self.logical_page_size, self.num_tokens)
-        for page_idx, page_ref in enumerate(self.logical_page_table[1:], start=1):
-            slot_start = page_ref.block_id * self.block_size + page_ref.block_offset
-            slot_end = slot_start + page_ref.page_tokens
-            page_end_token = min((page_idx + 1) * self.logical_page_size, self.num_tokens)
-            if page_ref.cached == current_cached and slot_start == current_slot_end:
-                current_slot_end = slot_end
-                current_end_page = page_idx + 1
-                current_end_token = page_end_token
+        span_specs = []
+        for page_idx, page_ref in enumerate(self.logical_page_table):
+            page_start_token = page_idx * self.logical_page_size
+            slot_base = page_ref.block_id * self.block_size + page_ref.block_offset
+            if page_ref.cached_tokens > 0:
+                span_specs.append(PhysicalAddressSpan(
+                    page_idx,
+                    page_idx + 1,
+                    page_start_token,
+                    page_start_token + page_ref.cached_tokens,
+                    slot_base,
+                    slot_base + page_ref.cached_tokens,
+                    True,
+                ))
+            if page_ref.uncached_tokens > 0:
+                span_specs.append(PhysicalAddressSpan(
+                    page_idx,
+                    page_idx + 1,
+                    page_start_token + page_ref.cached_tokens,
+                    page_start_token + page_ref.page_tokens,
+                    slot_base + page_ref.cached_tokens,
+                    slot_base + page_ref.page_tokens,
+                    False,
+                ))
+        if not span_specs:
+            return []
+        current = span_specs[0]
+        for spec in span_specs[1:]:
+            if (
+                spec.cached == current.cached
+                and spec.slot_start == current.slot_end
+                and spec.start_token == current.end_token
+            ):
+                current = PhysicalAddressSpan(
+                    current.start_page,
+                    spec.end_page,
+                    current.start_token,
+                    spec.end_token,
+                    current.slot_start,
+                    spec.slot_end,
+                    current.cached,
+                )
                 continue
-            spans.append(PhysicalAddressSpan(
-                start_page,
-                current_end_page,
-                start_page * self.logical_page_size,
-                current_end_token,
-                current_slot_start,
-                current_slot_end,
-                current_cached,
-            ))
-            start_page = page_idx
-            current_cached = page_ref.cached
-            current_slot_start = slot_start
-            current_slot_end = slot_end
-            current_end_page = page_idx + 1
-            current_end_token = page_end_token
-        spans.append(PhysicalAddressSpan(
-            start_page,
-            current_end_page,
-            start_page * self.logical_page_size,
-            current_end_token,
-            current_slot_start,
-            current_slot_end,
-            current_cached,
-        ))
+            spans.append(current)
+            current = spec
+        spans.append(current)
         if cached is None:
             return spans
         return [span for span in spans if span.cached is cached]
@@ -235,7 +252,6 @@ class Sequence:
         if not self.block_table:
             self.prefill_layout = None
             return
-        assert self.num_cached_tokens % self.logical_page_size == 0
         cached_page_mask = [page_ref.cached for page_ref in self.logical_page_table]
         cached_page_spans = self.logical_page_spans(cached=True)
         uncached_page_spans = self.logical_page_spans(cached=False)
@@ -247,8 +263,6 @@ class Sequence:
             assert cached_page_spans[0].end_token == self.num_cached_tokens
         uncached_start_page = uncached_page_spans[0].start_page if uncached_page_spans else self.num_logical_pages
         uncached_start_token = uncached_page_spans[0].start_token if uncached_page_spans else self.num_tokens
-        if cached_page_spans and uncached_page_spans:
-            assert cached_page_spans[0].end_page == uncached_start_page
         uncached_end_token = self.num_tokens
         uncached_num_pages = sum(span.end_page - span.start_page for span in uncached_page_spans)
         uncached_num_tokens = uncached_end_token - uncached_start_token
@@ -256,6 +270,7 @@ class Sequence:
         self.prefill_layout = RequestPrefillLayout(
             page_block_ids=[page_ref.block_id for page_ref in self.logical_page_table],
             cached_page_mask=cached_page_mask,
+            page_cached_tokens=[page_ref.cached_tokens for page_ref in self.logical_page_table],
             cached_page_spans=cached_page_spans,
             uncached_page_spans=uncached_page_spans,
             cached_physical_spans=cached_physical_spans,

@@ -210,6 +210,7 @@ class PrefixCache:
 class PlanStepKind(Enum):
     HIT_USED = auto()
     HIT_FREE = auto()
+    PARTIAL_HIT_FREE = auto()
     MISS = auto()
 
 
@@ -219,6 +220,8 @@ class PlanStep:
     block_id: int
     block_hash: int
     token_ids: list[int]
+    shared_prefix_tokens: int = 0
+    prefix_hash_before_block: int = -1
 
 
 @dataclass
@@ -230,6 +233,7 @@ class PrefillPlan:
     required_logical_pages: int
     page_block_ids: list[int]
     cached_page_mask: list[bool]
+    page_cached_tokens: list[int]
     cached_page_spans: list[LogicalPageSpan]
     uncached_page_spans: list[LogicalPageSpan]
     uncached_start_token: int
@@ -251,6 +255,8 @@ class BlockManager:
         self.used_block_ids = self.allocator.used_block_ids
         self.hash_to_block_id = self.prefix_cache.hash_to_block_id
         self.retention_low_watermark = max(1, num_blocks // 8)
+        self.partial_prefix_to_block_ids: dict[int, set[int]] = dict()
+        self.partial_block_to_prefix: dict[int, int] = dict()
         self.stats = {
             "alloc_requests": 0,
             "dealloc_requests": 0,
@@ -258,6 +264,7 @@ class BlockManager:
             "hit_blocks": 0,
             "miss_blocks": 0,
             "reused_tokens": 0,
+            "partial_reused_tokens": 0,
             "reused_logical_pages": 0,
             "prefill_cached_pages": 0,
             "prefill_uncached_pages": 0,
@@ -281,30 +288,63 @@ class BlockManager:
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         return PrefixCache.compute_hash(token_ids, prefix)
 
-    def build_page_spans(self, cached_page_mask: list[bool], num_tokens: int) -> tuple[list[LogicalPageSpan], list[LogicalPageSpan]]:
-        if not cached_page_mask:
-            return [], []
+    @staticmethod
+    def common_prefix_len(lhs: list[int], rhs: list[int]) -> int:
+        matched = 0
+        max_len = min(len(lhs), len(rhs))
+        while matched < max_len and lhs[matched] == rhs[matched]:
+            matched += 1
+        return matched
+
+    def unregister_partial_block(self, block_id: int):
+        prefix_hash = self.partial_block_to_prefix.pop(block_id, None)
+        if prefix_hash is None:
+            return
+        block_ids = self.partial_prefix_to_block_ids.get(prefix_hash)
+        if block_ids is None:
+            return
+        block_ids.discard(block_id)
+        if not block_ids:
+            del self.partial_prefix_to_block_ids[prefix_hash]
+
+    def register_partial_block(self, block_id: int, prefix_hash_before_block: int, token_ids: list[int]):
+        self.unregister_partial_block(block_id)
+        if not token_ids or len(token_ids) == self.block_size:
+            return
+        self.blocks[block_id].update(-1, token_ids)
+        self.partial_prefix_to_block_ids.setdefault(prefix_hash_before_block, set()).add(block_id)
+        self.partial_block_to_prefix[block_id] = prefix_hash_before_block
+
+    def find_best_partial_hit(self, prefix_hash_before_block: int, token_ids: list[int]) -> tuple[int, int]:
+        best_block_id = -1
+        best_shared_prefix_tokens = 0
+        for block_id in self.partial_prefix_to_block_ids.get(prefix_hash_before_block, set()):
+            if self.allocator.is_used(block_id):
+                continue
+            shared_prefix_tokens = self.common_prefix_len(self.blocks[block_id].token_ids, token_ids)
+            if shared_prefix_tokens > best_shared_prefix_tokens:
+                best_block_id = block_id
+                best_shared_prefix_tokens = shared_prefix_tokens
+        return best_block_id, best_shared_prefix_tokens
+
+    def build_page_spans(self, cached_tokens: int, num_tokens: int, num_logical_pages: int) -> tuple[list[LogicalPageSpan], list[LogicalPageSpan]]:
         spans = []
-        start_page = 0
-        current_cached = cached_page_mask[0]
-        for page_idx, is_cached in enumerate(cached_page_mask[1:], start=1):
-            if is_cached != current_cached:
-                spans.append(LogicalPageSpan(
-                    start_page,
-                    page_idx,
-                    start_page * self.logical_page_size,
-                    min(page_idx * self.logical_page_size, num_tokens),
-                    current_cached,
-                ))
-                start_page = page_idx
-                current_cached = is_cached
-        spans.append(LogicalPageSpan(
-            start_page,
-            len(cached_page_mask),
-            start_page * self.logical_page_size,
-            num_tokens,
-            current_cached,
-        ))
+        if cached_tokens > 0:
+            spans.append(LogicalPageSpan(
+                0,
+                (cached_tokens + self.logical_page_size - 1) // self.logical_page_size,
+                0,
+                cached_tokens,
+                True,
+            ))
+        if cached_tokens < num_tokens:
+            spans.append(LogicalPageSpan(
+                cached_tokens // self.logical_page_size,
+                num_logical_pages,
+                cached_tokens,
+                num_tokens,
+                False,
+            ))
         cached_spans = [span for span in spans if span.cached]
         uncached_spans = [span for span in spans if not span.cached]
         return cached_spans, uncached_spans
@@ -318,9 +358,11 @@ class BlockManager:
         required_free_blocks = 0
         page_block_ids = []
         cached_page_mask = []
+        page_cached_tokens = []
 
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
+            prefix_hash_before_block = prefix_hash
             block_hash = self.prefix_cache.compute_block_hash(token_ids, prefix_hash)
             node = None if cache_miss else self.prefix_cache.get_child(prefix_node, token_ids)
             block_id = -1 if node is None else node.block_id
@@ -329,33 +371,63 @@ class BlockManager:
             if is_hit:
                 cached_tokens += self.block_size
                 if self.allocator.is_used(block_id):
-                    steps.append(PlanStep(PlanStepKind.HIT_USED, block_id, block_hash, token_ids))
+                    steps.append(PlanStep(PlanStepKind.HIT_USED, block_id, block_hash, token_ids, len(token_ids), prefix_hash_before_block))
                 else:
                     required_free_blocks += 1
-                    steps.append(PlanStep(PlanStepKind.HIT_FREE, block_id, block_hash, token_ids))
+                    steps.append(PlanStep(PlanStepKind.HIT_FREE, block_id, block_hash, token_ids, len(token_ids), prefix_hash_before_block))
                 page_block_ids.extend([block_id] * num_pages)
                 cached_page_mask.extend([True] * num_pages)
+                page_cached_tokens.extend([
+                    min(self.logical_page_size, len(token_ids) - page_idx * self.logical_page_size)
+                    for page_idx in range(num_pages)
+                ])
                 prefix_node = node
             else:
-                cache_miss = True
-                required_free_blocks += 1
-                steps.append(PlanStep(PlanStepKind.MISS, -1, block_hash, token_ids))
-                page_block_ids.extend([-1] * num_pages)
-                cached_page_mask.extend([False] * num_pages)
+                partial_block_id, shared_prefix_tokens = (-1, 0)
+                if not cache_miss and len(token_ids) < self.block_size:
+                    partial_block_id, shared_prefix_tokens = self.find_best_partial_hit(prefix_hash_before_block, token_ids)
+                if partial_block_id != -1 and shared_prefix_tokens > 0:
+                    cache_miss = True
+                    cached_tokens += shared_prefix_tokens
+                    required_free_blocks += 1
+                    steps.append(PlanStep(
+                        PlanStepKind.PARTIAL_HIT_FREE,
+                        partial_block_id,
+                        -1,
+                        token_ids,
+                        shared_prefix_tokens,
+                        prefix_hash_before_block,
+                    ))
+                    page_block_ids.extend([partial_block_id] * num_pages)
+                    for page_idx in range(num_pages):
+                        page_start = page_idx * self.logical_page_size
+                        page_tokens = min(self.logical_page_size, len(token_ids) - page_start)
+                        cached_in_page = min(max(shared_prefix_tokens - page_start, 0), page_tokens)
+                        page_cached_tokens.append(cached_in_page)
+                        cached_page_mask.append(cached_in_page == page_tokens)
+                else:
+                    cache_miss = True
+                    required_free_blocks += 1
+                    steps.append(PlanStep(PlanStepKind.MISS, -1, block_hash, token_ids, 0, prefix_hash_before_block))
+                    page_block_ids.extend([-1] * num_pages)
+                    cached_page_mask.extend([False] * num_pages)
+                    page_cached_tokens.extend([0] * num_pages)
             prefix_hash = block_hash
 
         uncached_tokens = len(seq) - cached_tokens
-        cached_logical_pages = cached_tokens // self.logical_page_size
-        required_logical_pages = (uncached_tokens + self.logical_page_size - 1) // self.logical_page_size
+        cached_logical_pages = sum(
+            cached_in_page == self.logical_page_size
+            for cached_in_page in page_cached_tokens
+        )
+        required_logical_pages = seq.num_logical_pages - (cached_tokens // self.logical_page_size)
         assert len(page_block_ids) == seq.num_logical_pages
         assert len(cached_page_mask) == seq.num_logical_pages
-        cached_page_spans, uncached_page_spans = self.build_page_spans(cached_page_mask, len(seq))
-        total_span_pages = sum(span.end_page - span.start_page for span in cached_page_spans + uncached_page_spans)
-        assert total_span_pages == seq.num_logical_pages
-        uncached_start_token = uncached_page_spans[0].start_token if uncached_page_spans else len(seq)
-        uncached_start_page = uncached_page_spans[0].start_page if uncached_page_spans else seq.num_logical_pages
+        assert len(page_cached_tokens) == seq.num_logical_pages
+        cached_page_spans, uncached_page_spans = self.build_page_spans(cached_tokens, len(seq), seq.num_logical_pages)
+        uncached_start_token = cached_tokens
+        uncached_start_page = cached_tokens // self.logical_page_size
         uncached_num_tokens = len(seq) - uncached_start_token
-        uncached_num_pages = sum(span.end_page - span.start_page for span in uncached_page_spans)
+        uncached_num_pages = seq.num_logical_pages - uncached_start_page
         assert uncached_start_token == cached_tokens
         assert uncached_num_pages == required_logical_pages
         return PrefillPlan(
@@ -366,6 +438,7 @@ class BlockManager:
             required_logical_pages,
             page_block_ids,
             cached_page_mask,
+            page_cached_tokens,
             cached_page_spans,
             uncached_page_spans,
             uncached_start_token,
@@ -419,28 +492,39 @@ class BlockManager:
             if step.kind == PlanStepKind.MISS:
                 self.stats["miss_blocks"] += 1
                 block_id, block = self.allocator.allocate_next_free_block()
+                self.unregister_partial_block(block_id)
                 self.stats["new_blocks"] += 1
             elif step.kind == PlanStepKind.HIT_USED:
                 self.stats["hit_blocks"] += 1
-                self.stats["reused_tokens"] += self.block_size
-                self.stats["reused_logical_pages"] += self.block_size // self.logical_page_size
+                self.stats["reused_tokens"] += step.shared_prefix_tokens
+                self.stats["reused_logical_pages"] += step.shared_prefix_tokens // self.logical_page_size
                 block_id = step.block_id
                 block = self.allocator.incref(block_id)
-            else:
+            elif step.kind == PlanStepKind.HIT_FREE:
                 self.stats["hit_blocks"] += 1
-                self.stats["reused_tokens"] += self.block_size
-                self.stats["reused_logical_pages"] += self.block_size // self.logical_page_size
+                self.stats["reused_tokens"] += step.shared_prefix_tokens
+                self.stats["reused_logical_pages"] += step.shared_prefix_tokens // self.logical_page_size
                 block_id = step.block_id
                 block = self.allocator.allocate_block(block_id)
+            else:
+                block_id = step.block_id
+                self.unregister_partial_block(block_id)
+                block = self.allocator.allocate_block(block_id)
+                self.stats["reused_tokens"] += step.shared_prefix_tokens
+                self.stats["partial_reused_tokens"] += step.shared_prefix_tokens
+                self.stats["reused_logical_pages"] += step.shared_prefix_tokens // self.logical_page_size
 
             if step.block_hash != -1:
                 prefix_node = self.prefix_cache.commit(prefix_node, block, step.block_hash, token_ids)
+            else:
+                block.update(-1, token_ids)
             seq.block_table.append(block_id)
         seq.sync_logical_page_table()
         seq.sync_prefill_layout()
         layout = seq.prefill_layout
         assert layout is not None
         assert layout.cached_page_mask == plan.cached_page_mask
+        assert layout.page_cached_tokens == plan.page_cached_tokens
         assert layout.cached_page_spans == plan.cached_page_spans
         assert layout.uncached_page_spans == plan.uncached_page_spans
         assert layout.uncached_start_token == plan.uncached_start_token
@@ -451,6 +535,14 @@ class BlockManager:
 
     def deallocate(self, seq: Sequence):
         self.stats["dealloc_requests"] += 1
+        prefix_hash = -1
+        for block_idx, block_id in enumerate(seq.block_table):
+            token_ids = seq.block(block_idx)
+            if len(token_ids) < self.block_size:
+                self.register_partial_block(block_id, prefix_hash, token_ids)
+            else:
+                self.unregister_partial_block(block_id)
+            prefix_hash = self.prefix_cache.compute_block_hash(token_ids, prefix_hash)
         for block_id in reversed(seq.block_table):
             self.allocator.decref(block_id)
         seq.num_cached_tokens = 0
@@ -469,6 +561,7 @@ class BlockManager:
             assert last_block.hash != -1
             self.apply_retention_policy(1, set(block_table))
             block_id, _ = self.allocator.allocate_next_free_block()
+            self.unregister_partial_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1

@@ -984,3 +984,119 @@ to
 - physical slot spans
 
 which is the right foundation for the next true addressing/storage step.
+
+## Phase 12 - Relax Page-Boundary Assumptions In Request-Side Addressing
+
+### Route Choice
+This Stage C step does not change actual reuse semantics.
+Instead it relaxes an internal metadata assumption:
+- request-side cached boundaries are no longer forced to be representable only as whole cached pages
+
+The runtime still hits only whole blocks, but the request-side addressing layer can now express a cached prefix boundary that falls inside a logical page.
+
+### Files Changed
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/model_runner.py`
+- `run_page_aware_prefill_checks.sh`
+
+### Main Design Change
+`LogicalPageRef` now stores `cached_tokens` instead of only a boolean cached flag.
+This adds three derived concepts on each page:
+- fully cached page
+- fully uncached page
+- partially cached boundary page
+
+`RequestPrefillLayout` now also stores:
+- `page_cached_tokens`
+
+So request-side metadata can represent an internal boundary that lands in the middle of a logical page, even though the current runtime still only produces block-aligned cached prefixes.
+
+### Addressing Change
+`Sequence.physical_address_spans()` was updated to split each page into:
+- cached physical segment
+- uncached physical segment
+
+when needed, then merge adjacent segments only when their physical slots are actually contiguous.
+
+This is important because future finer-grained reuse will need:
+- token-accurate logical boundaries
+- but still must respect actual physical slot continuity
+
+### Validation Change
+`prepare_logical_page_metadata()` now validates:
+- `sum(page_cached_tokens) == num_cached_tokens`
+- physical cached/uncached spans still cover the same token counts as logical spans
+
+`run_page_aware_prefill_checks.sh` now also checks the new `page_cached_tokens` field.
+
+### What Is Still Not Done
+This still does **not** enable partial-page or partial-block reuse in execution.
+The current allocator and prefix cache still only create block-level hits.
+
+What changed is that the request-side addressing model is no longer structurally blocked from representing a finer cached boundary.
+
+## Phase 13 - First Real Finer-Grained Reuse For Free Partial Tail Blocks
+
+### Route Choice
+This phase introduces the first real finer-grained reuse path without touching active-block copy-on-write.
+
+The implemented scope is intentionally narrow:
+- only reuse prefixes from **free** partial last blocks
+- do not reuse partial prefixes from blocks still referenced by active requests
+- do not change physical KV allocation granularity
+
+This makes it the smallest safe step that actually reduces prefill work below block granularity.
+
+### Files Changed
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/engine/llm_engine.py`
+- `run_page_aware_prefill_checks.sh`
+
+### Main Design Change
+Added a partial-tail index inside `BlockManager`:
+- `partial_prefix_to_block_ids`
+- `partial_block_to_prefix`
+
+Partial last blocks are now registered on deallocation using the prefix hash of the preceding full-block path.
+When a future request reaches a partial last block under the same block-prefix path, the planner can:
+- compare the new partial block against retained free partial blocks
+- find the longest shared token prefix
+- reuse that shared prefix directly if the source block is free
+
+### Planning Change
+Introduced `PlanStepKind.PARTIAL_HIT_FREE`.
+
+`make_prefill_plan()` can now produce a plan where:
+- the first N tokens of the partial tail block are already cached
+- only the remaining suffix inside that block must be prefilling
+
+This means `cached_tokens` is no longer forced to be block-aligned.
+
+### Allocation Change
+For `PARTIAL_HIT_FREE`, allocation now:
+- reserves the matching free block
+- keeps the already-matching prefix portion in place
+- overwrites only the uncached suffix tokens later during prefill
+
+No copy-on-write is needed because the reused source block is free.
+
+### Observability
+Added:
+- `partial_reused_tokens`
+
+to distinguish true sub-block savings from ordinary whole-block prefix hits.
+
+### Validation
+Updated `run_page_aware_prefill_checks.sh` so the non-aligned case now expects real partial reuse:
+- shared prefix length = 600
+- previous behavior = 512 cached tokens
+- new behavior = 600 cached tokens
+
+This confirms that the first finer-grained reuse path is active.
+
+### What Is Still Not Done
+This is still not the full SGLang-like endpoint.
+Missing pieces include:
+- partial reuse for blocks still in active use
+- copy-on-write or smaller physical allocation units
+- generalized page/token-level prefix indexing beyond retained free partial tails

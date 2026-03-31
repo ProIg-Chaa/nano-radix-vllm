@@ -18,6 +18,7 @@ def synthesize_uncached_prefill_layout(seq: Sequence) -> RequestPrefillLayout:
     return RequestPrefillLayout(
         page_block_ids=[-1] * seq.num_logical_pages,
         cached_page_mask=[False] * seq.num_logical_pages,
+        page_cached_tokens=[0] * seq.num_logical_pages,
         cached_page_spans=[],
         uncached_page_spans=uncached_page_spans,
         cached_physical_spans=[],
@@ -194,6 +195,7 @@ class ModelRunner:
                 uncached_page_tokens = sum(
                     span.end_token - span.start_token for span in layout.uncached_page_spans
                 )
+                total_page_cached_tokens = sum(layout.page_cached_tokens)
                 cached_physical_tokens = sum(
                     span.slot_end - span.slot_start for span in layout.cached_physical_spans
                 )
@@ -206,6 +208,7 @@ class ModelRunner:
                 )
                 assert total_span_pages == seq.num_logical_pages
                 assert cached_page_tokens == seq.num_cached_tokens
+                assert total_page_cached_tokens == seq.num_cached_tokens
                 assert layout.uncached_start_token == seq.num_cached_tokens
                 assert layout.uncached_end_token == len(seq)
                 assert layout.uncached_num_tokens == len(seq) - seq.num_cached_tokens
@@ -216,8 +219,6 @@ class ModelRunner:
                 if layout.cached_page_spans:
                     assert len(layout.cached_page_spans) == 1
                     assert layout.cached_page_spans[0].start_page == 0
-                if layout.cached_page_spans and layout.uncached_page_spans:
-                    assert layout.cached_page_spans[-1].end_page == layout.uncached_page_spans[0].start_page
                 if layout.cached_physical_spans:
                     assert layout.cached_physical_spans[0].start_page == 0
                     assert layout.cached_physical_spans[-1].end_token == seq.num_cached_tokens
@@ -255,7 +256,11 @@ class ModelRunner:
                 continue
             page_aware_slot_mapping = build_page_aware_prefill_slot_mapping(seq, self.block_size, layout)
             legacy_slot_mapping = build_legacy_prefill_slot_mapping(seq, self.block_size)
-            assert page_aware_slot_mapping == legacy_slot_mapping
+            if layout.uncached_start_token % self.block_size == 0:
+                assert page_aware_slot_mapping == legacy_slot_mapping
+            else:
+                assert len(page_aware_slot_mapping) <= len(legacy_slot_mapping)
+                assert len(page_aware_slot_mapping) == layout.uncached_num_tokens
             slot_mapping.extend(page_aware_slot_mapping)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
