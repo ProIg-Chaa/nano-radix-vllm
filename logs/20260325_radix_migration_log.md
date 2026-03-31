@@ -915,3 +915,72 @@ The next phase should target the true logic-to-storage bridge:
 - thread page-aware addressing deeper than a read-only equivalence layer
 - then decide whether the allocator/context/backend must grow a physical page abstraction
 
+## Phase 11 - Start Stage C With Explicit Physical Address Spans
+
+### Route Choice
+Stage C is started here as a **request-side addressing bridge**, not as immediate partial-block reuse.
+The intent is:
+- keep physical KV allocation block-based
+- keep attention/context interfaces unchanged
+- but make request-side page metadata capable of expressing the actual physical slot spans that the runner consumes
+
+This separates:
+- logical page layout
+- physical slot layout
+
+more explicitly than Stage B.
+
+### Files Changed
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/model_runner.py`
+- `run_page_aware_prefill_checks.sh`
+
+### Main Design Change
+Added `PhysicalAddressSpan` to `Sequence` and extended `RequestPrefillLayout` with:
+- `cached_physical_spans`
+- `uncached_physical_spans`
+
+These spans are derived from the request's `logical_page_table`, but they no longer assume that a logical page region should be consumed only as a page mask or page span.
+Instead they record the actual physical slot intervals:
+- `slot_start`
+- `slot_end`
+
+for contiguous page ranges.
+
+### Why This Matters
+Stage B ended with page-aware prefill preparation, but the runner still effectively depended on reconstructing slot mapping from logical page refs one page at a time.
+
+This Phase 11 step makes the logic-to-storage bridge more explicit:
+- request-side metadata now directly carries physical slot spans
+- the runner consumes those spans to build prefill `slot_mapping`
+- validation checks now verify both logical coverage and physical-slot coverage
+
+In other words, Stage C now has an explicit representation of how logical cached/uncached page regions map onto physical KV slots.
+
+### Runner Changes
+`build_page_aware_prefill_slot_mapping()` now expands `uncached_physical_spans` directly rather than rebuilding the uncached region from block/page refs.
+
+`prepare_logical_page_metadata()` now validates:
+- logical cached token coverage
+- logical uncached token coverage
+- physical cached slot coverage
+- physical uncached slot coverage
+- consistency between page spans and physical address spans
+
+### Validation
+Updated `run_page_aware_prefill_checks.sh` to assert:
+- cached physical span coverage matches `cached_tokens`
+- uncached physical span coverage matches `uncached_num_tokens`
+- cached physical spans end exactly at the cached prefix boundary
+- uncached physical spans start exactly at `uncached_start_token`
+
+### What Is Still Not Done
+This still does **not** implement partial-block reuse.
+The cached prefix boundary is still determined by block-level prefix hits.
+
+What changed is that the request now has a more explicit bridge from:
+- logical page spans
+to
+- physical slot spans
+
+which is the right foundation for the next true addressing/storage step.

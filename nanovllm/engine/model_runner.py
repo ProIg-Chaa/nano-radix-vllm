@@ -5,7 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import LogicalPageSpan, RequestPrefillLayout, Sequence
+from nanovllm.engine.sequence import LogicalPageSpan, PhysicalAddressSpan, RequestPrefillLayout, Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -20,6 +20,8 @@ def synthesize_uncached_prefill_layout(seq: Sequence) -> RequestPrefillLayout:
         cached_page_mask=[False] * seq.num_logical_pages,
         cached_page_spans=[],
         uncached_page_spans=uncached_page_spans,
+        cached_physical_spans=[],
+        uncached_physical_spans=[],
         uncached_start_token=0,
         uncached_end_token=len(seq),
         uncached_start_page=0,
@@ -58,20 +60,10 @@ def build_page_aware_prefill_slot_mapping(
     layout = get_effective_prefill_layout(seq) if layout is None else layout
     if not seq.block_table:
         return []
-    if not seq.logical_page_table:
-        seq.sync_logical_page_table()
-    uncached_page_refs = seq.logical_page_table[
-        layout.uncached_start_page: layout.uncached_start_page + layout.uncached_num_pages
-    ]
-    assert len(uncached_page_refs) == layout.uncached_num_pages
     slot_mapping = []
-    for page_idx, page_ref in enumerate(uncached_page_refs, start=layout.uncached_start_page):
-        assert not layout.cached_page_mask[page_idx]
-        assert page_ref.cached is False
-        assert layout.page_block_ids[page_idx] == page_ref.block_id
-        start = page_ref.block_id * block_size + page_ref.block_offset
-        end = start + page_ref.page_tokens
-        slot_mapping.extend(range(start, end))
+    for span in layout.uncached_physical_spans:
+        assert not span.cached
+        slot_mapping.extend(range(span.slot_start, span.slot_end))
     assert len(slot_mapping) == layout.uncached_num_tokens
     return slot_mapping
 
@@ -196,21 +188,42 @@ class ModelRunner:
             if seq.block_table:
                 if not seq.logical_page_table:
                     seq.sync_logical_page_table()
+                cached_page_tokens = sum(
+                    span.end_token - span.start_token for span in layout.cached_page_spans
+                )
+                uncached_page_tokens = sum(
+                    span.end_token - span.start_token for span in layout.uncached_page_spans
+                )
+                cached_physical_tokens = sum(
+                    span.slot_end - span.slot_start for span in layout.cached_physical_spans
+                )
+                uncached_physical_tokens = sum(
+                    span.slot_end - span.slot_start for span in layout.uncached_physical_spans
+                )
                 total_span_pages = sum(
                     span.end_page - span.start_page
                     for span in layout.cached_page_spans + layout.uncached_page_spans
                 )
                 assert total_span_pages == seq.num_logical_pages
+                assert cached_page_tokens == seq.num_cached_tokens
                 assert layout.uncached_start_token == seq.num_cached_tokens
                 assert layout.uncached_end_token == len(seq)
                 assert layout.uncached_num_tokens == len(seq) - seq.num_cached_tokens
                 assert layout.uncached_start_page == seq.num_cached_logical_pages
                 assert layout.uncached_num_pages == seq.num_logical_pages - seq.num_cached_logical_pages
+                assert cached_physical_tokens == cached_page_tokens
+                assert uncached_physical_tokens == uncached_page_tokens
                 if layout.cached_page_spans:
                     assert len(layout.cached_page_spans) == 1
                     assert layout.cached_page_spans[0].start_page == 0
                 if layout.cached_page_spans and layout.uncached_page_spans:
                     assert layout.cached_page_spans[-1].end_page == layout.uncached_page_spans[0].start_page
+                if layout.cached_physical_spans:
+                    assert layout.cached_physical_spans[0].start_page == 0
+                    assert layout.cached_physical_spans[-1].end_token == seq.num_cached_tokens
+                if layout.uncached_physical_spans:
+                    assert layout.uncached_physical_spans[0].start_token == layout.uncached_start_token
+                    assert layout.uncached_physical_spans[-1].end_token == len(seq)
             metadata.append(layout)
         return metadata
 

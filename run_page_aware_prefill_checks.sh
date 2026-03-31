@@ -42,6 +42,14 @@ def validate_allocated_seq(seq, plan):
     assert layout.cached_page_spans == plan.cached_page_spans
     assert layout.uncached_page_spans == plan.uncached_page_spans
     assert layout.cached_page_mask == plan.cached_page_mask
+    assert sum(span.slot_end - span.slot_start for span in layout.cached_physical_spans) == plan.cached_tokens
+    assert sum(span.slot_end - span.slot_start for span in layout.uncached_physical_spans) == plan.uncached_num_tokens
+    if layout.cached_physical_spans:
+        assert layout.cached_physical_spans[0].start_page == 0
+        assert layout.cached_physical_spans[-1].end_token == plan.cached_tokens
+    if layout.uncached_physical_spans:
+        assert layout.uncached_physical_spans[0].start_token == plan.uncached_start_token
+        assert layout.uncached_physical_spans[-1].end_token == len(seq)
     assert build_page_aware_prefill_slot_mapping(seq, BLOCK_SIZE) == build_legacy_prefill_slot_mapping(seq, BLOCK_SIZE)
 
 

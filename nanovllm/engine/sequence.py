@@ -30,11 +30,24 @@ class LogicalPageSpan:
 
 
 @dataclass
+class PhysicalAddressSpan:
+    start_page: int
+    end_page: int
+    start_token: int
+    end_token: int
+    slot_start: int
+    slot_end: int
+    cached: bool
+
+
+@dataclass
 class RequestPrefillLayout:
     page_block_ids: list[int]
     cached_page_mask: list[bool]
     cached_page_spans: list[LogicalPageSpan]
     uncached_page_spans: list[LogicalPageSpan]
+    cached_physical_spans: list[PhysicalAddressSpan]
+    uncached_physical_spans: list[PhysicalAddressSpan]
     uncached_start_token: int
     uncached_end_token: int
     uncached_start_page: int
@@ -170,6 +183,54 @@ class Sequence:
             return spans
         return [span for span in spans if span.cached is cached]
 
+    def physical_address_spans(self, cached: bool | None = None) -> list[PhysicalAddressSpan]:
+        if not self.logical_page_table:
+            return []
+        spans = []
+        start_page = 0
+        first_page = self.logical_page_table[0]
+        current_cached = first_page.cached
+        current_slot_start = first_page.block_id * self.block_size + first_page.block_offset
+        current_slot_end = current_slot_start + first_page.page_tokens
+        current_end_page = 1
+        current_end_token = min(self.logical_page_size, self.num_tokens)
+        for page_idx, page_ref in enumerate(self.logical_page_table[1:], start=1):
+            slot_start = page_ref.block_id * self.block_size + page_ref.block_offset
+            slot_end = slot_start + page_ref.page_tokens
+            page_end_token = min((page_idx + 1) * self.logical_page_size, self.num_tokens)
+            if page_ref.cached == current_cached and slot_start == current_slot_end:
+                current_slot_end = slot_end
+                current_end_page = page_idx + 1
+                current_end_token = page_end_token
+                continue
+            spans.append(PhysicalAddressSpan(
+                start_page,
+                current_end_page,
+                start_page * self.logical_page_size,
+                current_end_token,
+                current_slot_start,
+                current_slot_end,
+                current_cached,
+            ))
+            start_page = page_idx
+            current_cached = page_ref.cached
+            current_slot_start = slot_start
+            current_slot_end = slot_end
+            current_end_page = page_idx + 1
+            current_end_token = page_end_token
+        spans.append(PhysicalAddressSpan(
+            start_page,
+            current_end_page,
+            start_page * self.logical_page_size,
+            current_end_token,
+            current_slot_start,
+            current_slot_end,
+            current_cached,
+        ))
+        if cached is None:
+            return spans
+        return [span for span in spans if span.cached is cached]
+
     def sync_prefill_layout(self):
         if not self.block_table:
             self.prefill_layout = None
@@ -178,6 +239,8 @@ class Sequence:
         cached_page_mask = [page_ref.cached for page_ref in self.logical_page_table]
         cached_page_spans = self.logical_page_spans(cached=True)
         uncached_page_spans = self.logical_page_spans(cached=False)
+        cached_physical_spans = self.physical_address_spans(cached=True)
+        uncached_physical_spans = self.physical_address_spans(cached=False)
         if cached_page_spans:
             assert len(cached_page_spans) == 1
             assert cached_page_spans[0].start_page == 0
@@ -195,6 +258,8 @@ class Sequence:
             cached_page_mask=cached_page_mask,
             cached_page_spans=cached_page_spans,
             uncached_page_spans=uncached_page_spans,
+            cached_physical_spans=cached_physical_spans,
+            uncached_physical_spans=uncached_physical_spans,
             uncached_start_token=uncached_start_token,
             uncached_end_token=uncached_end_token,
             uncached_start_page=uncached_start_page,
