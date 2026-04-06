@@ -1265,3 +1265,31 @@ The benchmark now clearly demonstrates the intended qualitative behavior:
   the original branch stops at the last full block.
 - The current radix branch therefore already demonstrates a concrete finer-grained reuse
   advantage over original `nano-vllm`.
+
+## 2026-04-06 Milestone Snapshot
+
+### Milestone Name
+`finer-grained-prefix-reuse`
+
+### Why This Is A Milestone
+This snapshot marks the point where the project is no longer only "radix-inspired" at
+the metadata/planning level. It now demonstrates a real runtime advantage from
+finer-grained prefix reuse.
+
+Concretely:
+- original `nano-vllm` reuses `512` tokens on the `600`-token nonaligned shared-prefix case
+- current `nano-vllm-radix` reuses `600` tokens on the same case
+
+That means the project has crossed the key boundary from:
+- block-level shared-prefix reuse only
+
+to:
+- block-level reuse plus finer-grained partial-tail reuse
+
+### Snapshot Meaning
+This version should be kept as a stable milestone reference for later stages because it
+captures the first end-to-end proof that the radix migration produced a concrete reuse
+gain beyond full-block alignment.
+
+Recommended Git reference:
+- annotated tag: `milestone-20260406-finer-grained-prefix-reuse`
