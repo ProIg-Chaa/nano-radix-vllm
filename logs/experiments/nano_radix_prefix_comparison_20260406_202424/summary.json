@@ -1,0 +1,164 @@
+{
+  "timestamp": "20260406_202424",
+  "model": "/share/home/wangzixu/liudinghao/gushuo/proj/transfoemer-llm/model/Qwen3-0.6B",
+  "original_repo": "/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm",
+  "radix_repo": "/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix",
+  "workloads": [
+    {
+      "name": "unique_long_cold",
+      "description": "Long unique prompts with no shared prefix. Used as baseline.",
+      "original": {
+        "name": "unique_long_cold",
+        "description": "Long unique prompts with no shared prefix. Used as baseline.",
+        "bench_latency_s": 27.47718271240592,
+        "requests": 4,
+        "prompt_tokens_total": 2408,
+        "completion_tokens_total": 16,
+        "completion_tokens_mean": 4,
+        "cached_tokens_total": 0,
+        "cached_tokens_per_request": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "cached_requests": 0,
+        "stats": null
+      },
+      "radix": {
+        "name": "unique_long_cold",
+        "description": "Long unique prompts with no shared prefix. Used as baseline.",
+        "bench_latency_s": 27.56116494908929,
+        "requests": 4,
+        "prompt_tokens_total": 2408,
+        "completion_tokens_total": 16,
+        "completion_tokens_mean": 4,
+        "cached_tokens_total": 0,
+        "cached_tokens_per_request": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "cached_requests": 0,
+        "stats": {
+          "alloc_requests": 4,
+          "dealloc_requests": 4,
+          "queried_blocks": 12,
+          "hit_blocks": 0,
+          "miss_blocks": 12,
+          "reused_tokens": 0,
+          "partial_reused_tokens": 0,
+          "reused_logical_pages": 0,
+          "prefill_cached_pages": 0,
+          "prefill_uncached_pages": 76,
+          "new_blocks": 12,
+          "eviction_passes": 0,
+          "evicted_leaves": 0,
+          "hit_rate": 0.0,
+          "logical_page_size": 32
+        }
+      }
+    },
+    {
+      "name": "aligned_shared_prefix_warm",
+      "description": "Warm one retained prompt with 768 shared-prefix tokens, then benchmark aligned shared-prefix reuse.",
+      "original": {
+        "name": "aligned_shared_prefix_warm",
+        "description": "Warm one retained prompt with 768 shared-prefix tokens, then benchmark aligned shared-prefix reuse.",
+        "bench_latency_s": 19.24279600009322,
+        "requests": 1,
+        "prompt_tokens_total": 770,
+        "completion_tokens_total": 4,
+        "completion_tokens_mean": 4,
+        "cached_tokens_total": 768,
+        "cached_tokens_per_request": [
+          768
+        ],
+        "cached_requests": 1,
+        "stats": null
+      },
+      "radix": {
+        "name": "aligned_shared_prefix_warm",
+        "description": "Warm one retained prompt with 768 shared-prefix tokens, then benchmark aligned shared-prefix reuse.",
+        "bench_latency_s": 17.46582219749689,
+        "requests": 1,
+        "prompt_tokens_total": 770,
+        "completion_tokens_total": 4,
+        "completion_tokens_mean": 4,
+        "cached_tokens_total": 768,
+        "cached_tokens_per_request": [
+          768
+        ],
+        "cached_requests": 1,
+        "stats": {
+          "alloc_requests": 1,
+          "dealloc_requests": 1,
+          "queried_blocks": 4,
+          "hit_blocks": 3,
+          "miss_blocks": 1,
+          "reused_tokens": 768,
+          "partial_reused_tokens": 0,
+          "reused_logical_pages": 24,
+          "prefill_cached_pages": 24,
+          "prefill_uncached_pages": 1,
+          "new_blocks": 1,
+          "eviction_passes": 0,
+          "evicted_leaves": 0,
+          "hit_rate": 0.75,
+          "logical_page_size": 32
+        }
+      }
+    },
+    {
+      "name": "nonaligned_shared_prefix_warm",
+      "description": "Warm one retained prompt with 600 shared-prefix tokens, then benchmark nonaligned shared-prefix reuse.",
+      "original": {
+        "name": "nonaligned_shared_prefix_warm",
+        "description": "Warm one retained prompt with 600 shared-prefix tokens, then benchmark nonaligned shared-prefix reuse.",
+        "bench_latency_s": 18.55520547553897,
+        "requests": 1,
+        "prompt_tokens_total": 602,
+        "completion_tokens_total": 4,
+        "completion_tokens_mean": 4,
+        "cached_tokens_total": 512,
+        "cached_tokens_per_request": [
+          512
+        ],
+        "cached_requests": 1,
+        "stats": null
+      },
+      "radix": {
+        "name": "nonaligned_shared_prefix_warm",
+        "description": "Warm one retained prompt with 600 shared-prefix tokens, then benchmark nonaligned shared-prefix reuse.",
+        "bench_latency_s": 18.783634778112173,
+        "requests": 1,
+        "prompt_tokens_total": 602,
+        "completion_tokens_total": 4,
+        "completion_tokens_mean": 4,
+        "cached_tokens_total": 600,
+        "cached_tokens_per_request": [
+          600
+        ],
+        "cached_requests": 1,
+        "stats": {
+          "alloc_requests": 1,
+          "dealloc_requests": 1,
+          "queried_blocks": 3,
+          "hit_blocks": 2,
+          "miss_blocks": 0,
+          "reused_tokens": 600,
+          "partial_reused_tokens": 88,
+          "reused_logical_pages": 18,
+          "prefill_cached_pages": 18,
+          "prefill_uncached_pages": 1,
+          "new_blocks": 0,
+          "eviction_passes": 0,
+          "evicted_leaves": 0,
+          "hit_rate": 0.6666666666666666,
+          "logical_page_size": 32
+        }
+      }
+    }
+  ]
+}

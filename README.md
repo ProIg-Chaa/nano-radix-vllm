@@ -1,504 +1,282 @@
-# Nano-vLLM Radix Migration Log - 2026-03-25
-@proig
-## Purpose
-This file is the running implementation log for integrating SGLang-style radix/prefix reuse ideas into `nano-vllm-radix`.
-Future modifications, experiments, refactors, and benchmark observations should continue to be appended here.
+# nano-vllm-radix
 
-## Current Goal
-Migrate the project step by step toward cross-request KV cache reuse for shared prefixes, while keeping each intermediate step verifiable and low risk.
+`nano-vllm-radix` is an experimental branch of `nano-vllm` that incrementally integrates
+SGLang-style radix/prefix reuse ideas into the original lightweight inference framework.
 
-## Phase 1 - Instrument Existing Prefix Cache
+The project goal is:
 
-### Objective
-Before changing scheduling or cache structure, verify whether the current block-level prefix cache is actually working, and quantify how much reuse it is already achieving.
+- preserve the simplicity of `nano-vllm`
+- add cross-request KV cache reuse for shared prefixes
+- gradually move from block-level prefix reuse toward finer-grained reuse
+- keep every step measurable and debuggable
 
-### Files Changed
-- `nanovllm/engine/block_manager.py`
-- `nanovllm/engine/llm_engine.py`
+This repository is not a verbatim port of SGLang. It is a staged migration that reuses
+the `nano-vllm` codebase and evolves it toward a more prefix-aware cache manager.
 
-### What Was Added
-#### 1. BlockManager statistics
-Added a `stats` dictionary to track:
-- `alloc_requests`
-- `dealloc_requests`
-- `queried_blocks`
+## Current Status
+
+The current branch already supports:
+
+- block-level shared-prefix KV reuse
+- prefix-aware prefill scheduling
+- tree-based prefix cache management
+- request-side logical page metadata
+- page-aware prefill preparation
+- finer-grained partial-tail prefix reuse
+- active partial-tail copy-on-write reuse
+
+The most important practical result is that the current branch can reuse a non-block-
+aligned shared prefix that the original `nano-vllm` cannot fully reuse.
+
+Example:
+
+- shared prefix length: `600` tokens
+- original `nano-vllm`: reuses `512`
+- `nano-vllm-radix`: reuses `600`
+
+## What Changed vs Original nano-vllm
+
+Compared with the original project in:
+
+- `/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm`
+
+this branch adds several major pieces.
+
+### 1. Prefix-cache instrumentation
+
+The engine now records and prints:
+
 - `hit_blocks`
 - `miss_blocks`
 - `reused_tokens`
-- `new_blocks`
+- `partial_reused_tokens`
+- `reused_logical_pages`
+- `prefill_cached_pages`
+- `prefill_uncached_pages`
+- eviction-related counters
 
-Also added:
-- `reset_stats()`
-- `get_stats()`
+This makes every cache-related change observable instead of speculative.
 
-#### 2. Allocation-path instrumentation
-Inside `BlockManager.allocate()`:
-- count each block lookup
-- count hit/miss blocks
-- count reused tokens
-- count newly allocated blocks
+### 2. Cache-manager refactor
 
-Inside `BlockManager.deallocate()`:
-- count deallocation requests
+`BlockManager` was split conceptually into:
 
-#### 3. Per-run stats printing
-Inside `LLMEngine.generate()`:
-- reset stats at the beginning of each generation run
-- print a single `[prefix-cache] ...` summary line at the end
+- physical KV block allocation
+- prefix cache / prefix tree indexing
+- scheduling-facing orchestration
 
-### Why This Step Was Necessary
-This step established whether the current implementation already performs useful block-level prefix reuse.
-Without this measurement, later radix-related refactors would be speculative.
+This makes later radix-style changes safer than editing one monolithic allocator class.
 
-### Validation Script
-Created helper scripts in project root:
-- `run_prefix_cache_test.sh`
-- `run_prefix_cache_test_small.sh`
-- `enter_nano_vllm_env.sh`
+### 3. Prefix-aware scheduling
 
-Also created experiment log directory:
-- `logs/experiments/`
+Prefill scheduling is no longer based only on raw request length. The scheduler now:
 
-The test scripts activate the `nano_vllm` micromamba environment, run a synthetic shared-prefix workload, and save logs with timestamps.
+1. builds a prefill plan
+2. estimates cached vs uncached prefix/tail cost
+3. estimates required free blocks
+4. decides admission using the real uncached cost
 
-### Synthetic Request Construction
-The main test workload used token-id prompts directly rather than natural language text:
+### 4. Tree-based prefix cache
 
-```python
-common_prefix = [123] * 768
-prompts = [
-    common_prefix + [1000 + i, 2000 + i, 3000 + i]
-    for i in range(8)
-]
-```
+The original flat block-hash lookup evolved into a prefix tree with:
 
-Interpretation:
-- 8 requests total
-- first 768 tokens identical across all requests
-- final 3 tokens differ per request
-- with block size 256, this yields 3 full shared blocks + 1 partial tail block
+- parent/child structure
+- ownership tracking
+- subtree pruning
+- leaf eviction / retention metadata
 
-### Observed Result
-Run log:
-- `logs/experiments/prefix_cache_test_20260324_123920.log`
+### 5. Logical page layer
 
-Observed stats:
+The runtime now distinguishes:
 
-```text
-[prefix-cache] alloc_reqs=8 dealloc_reqs=8 queried_blocks=32 hit_blocks=21 miss_blocks=11 hit_rate=65.62% reused_tokens=5376 new_blocks=11
-```
+- physical KV block size
+- logical page size
 
-### Interpretation
-This exactly matched the expected block-level reuse pattern:
-- request 0: 4 misses
-- requests 1-7: first 3 blocks hit, last partial block misses
-- total hits = 7 * 3 = 21
-- total reused tokens = 21 * 256 = 5376
+Current defaults:
 
-### Conclusion From Phase 1
-The existing implementation already supports useful block-level shared-prefix KV reuse.
-The current limitation is not "cache does not work", but rather:
-- reuse granularity is fixed at full blocks
-- partial trailing prefixes are not reusable
-- scheduling still does not use prefix match information early enough
+- `kvcache_block_size = 256`
+- `logical_page_size = 32`
 
-## Phase 2 - Refactor BlockManager Into Layers
+The request-side page layer includes:
 
-### Objective
-Separate physical KV block management from prefix lookup/indexing, while preserving current runtime behavior.
-This is a structural refactor intended to make later radix-style evolution much safer.
+- `LogicalPageRef`
+- `LogicalPageSpan`
+- `RequestPrefillLayout`
+- physical address spans
+- copy spans for partial-tail reuse
 
-### File Changed
+### 6. Finer-grained partial reuse
+
+The branch now supports:
+
+- retained free partial-tail reuse
+- active partial-tail reuse through copy-on-write
+
+This is the first real step beyond pure full-block reuse.
+
+## Architecture Snapshot
+
+At a high level, the current system has four layers:
+
+### Physical KV layer
+
+- block allocator
+- `block_table`
+- actual KV cache storage on GPU
+
+### Prefix cache layer
+
+- prefix tree
+- block ownership
+- retained leaf management
+- partial-tail prefix index
+
+### Request-side logical layer
+
+- logical pages
+- cached/uncached page spans
+- request prefill layout
+- physical slot spans derived from logical pages
+
+### Runner preparation layer
+
+- page-aware prefill planning
+- physical slot mapping
+- copy-on-write application before prefill
+
+The attention backend is still block-based. That is intentional: the current branch has
+already made the planner and request metadata page-aware, but it has not replaced the
+underlying physical KV storage model with a true page allocator.
+
+## Repository Layout
+
+Important files and directories:
+
 - `nanovllm/engine/block_manager.py`
-
-### Main Design Change
-Previously, `BlockManager` directly handled all of the following in one class:
-- free/used block bookkeeping
-- ref counts
-- block allocation and release
-- prefix hash computation
-- hash lookup
-- block commit/update
-- runtime statistics
-
-This was refactored into three logical layers:
-
-#### 1. `KVBlockAllocator`
-Responsibilities:
-- own all `Block` objects
-- own `free_block_ids`
-- own `used_block_ids`
-- allocate free blocks
-- increment/decrement ref counts
-- return blocks to free list when `ref_count == 0`
-
-This layer does **not** know anything about token sequences or prefix matching.
-
-#### 2. `PrefixCache`
-Responsibilities:
-- compute chained prefix hashes
-- only produce reusable hashes for full blocks
-- look up cached block ids from logical block content
-- commit a logical block into the cache index
-
-This layer does **not** manage free lists or ref counts.
-
-#### 3. `BlockManager`
-Responsibilities:
-- preserve the original public interface used by `Scheduler`
-- orchestrate calls between `PrefixCache` and `KVBlockAllocator`
-- keep instrumentation/stats in one place
-
-To preserve compatibility, these aliases were intentionally kept:
-- `self.blocks`
-- `self.free_block_ids`
-- `self.used_block_ids`
-- `self.hash_to_block_id`
-
-### Why This Refactor Was Necessary
-The original code mixed two different concerns:
-- logical prefix matching
-- physical memory/block lifecycle management
-
-That coupling would make future steps risky.
-For example, replacing the current hash-chain prefix lookup with a radix tree should mainly affect the prefix-cache layer, not the physical allocator.
-
-This refactor establishes a cleaner future evolution path:
-- change prefix lookup structure in `PrefixCache`
-- change eviction behavior in allocator-related logic
-- later adjust scheduling to match prefixes before checking allocation
-
-### Important Constraint
-This refactor was intentionally **behavior-preserving**.
-It did **not** change:
-- full-block-only reuse semantics
-- cache hit criteria
-- append semantics during decode
-- scheduler call pattern
-
-So the purpose of Phase 2 was not immediate speedup.
-Its purpose was to make subsequent changes isolated and easier to reason about.
-
-### Verification After Refactor
-Ran the smaller shared-prefix test after the refactor.
-Observed log:
-- `logs/experiments/prefix_cache_test_small_20260324_130733.log`
-
-Observed stats:
-
-```text
-[prefix-cache] alloc_reqs=4 dealloc_reqs=4 queried_blocks=16 hit_blocks=9 miss_blocks=7 hit_rate=56.25% reused_tokens=2304 new_blocks=7
-```
-
-Interpretation:
-- request 0: 4 misses
-- requests 1-3: each contributes 3 hits + 1 miss
-- total hits = 9
-- reused tokens = 9 * 256 = 2304
-
-This matched the expected behavior exactly, confirming that the refactor preserved semantics.
-
-## What Has Been Learned So Far
-1. The current project already has a functioning block-level prefix cache path.
-2. The real current limitation is granularity and scheduling, not absence of reuse.
-3. A stable allocator/cache separation is necessary before attempting a radix-tree-style prefix structure.
-4. Future work should proceed incrementally, with each step independently verifiable.
-
-## Recommended Next Step
-Phase 3 should make scheduling prefix-aware earlier in the decision process:
-- match prefix first
-- compute how many tail blocks actually need allocation
-- then decide whether the request can enter the batch
-
-This is the first step that should begin to produce systemic scheduling benefits beyond raw block reuse.
-
-
-## Phase 3 - Make Prefill Scheduling Prefix-Aware
-
-### Objective
-Move prefix matching earlier in the prefill scheduling path so that scheduling decisions are based on the true uncached tail and the true number of free blocks still required.
-
-### Files Changed
-- `nanovllm/engine/block_manager.py`
+  Cache manager, prefix tree, partial-tail reuse, planning
 - `nanovllm/engine/scheduler.py`
+  Prefix-aware scheduling
+- `nanovllm/engine/sequence.py`
+  Request-side page metadata and prefill layout
+- `nanovllm/engine/model_runner.py`
+  Page-aware prefill preparation and copy-span application
+- `run_prefix_cache_test.sh`
+  Basic shared-prefix synthetic benchmark
+- `run_prefix_cache_test_small.sh`
+  Smaller shared-prefix synthetic benchmark
+- `run_page_aware_prefill_checks.sh`
+  Directed validation for page-aware and partial-tail paths
+- `run_nano_radix_prefix_comparison.sh`
+  Original vs radix comparison experiment
+- `logs/`
+  Migration logs, bug logs, and experiment outputs
 
-### Problem Before This Step
-Before Phase 3, the scheduler admitted prefill requests using the raw request size:
-- batched token accounting used `len(seq)` before allocation
-- block-capacity checks used `seq.num_blocks`
+## Environment
 
-This missed an important distinction:
-- some blocks may already be cached and currently used by another request
-- some blocks may be cached but currently free and therefore only need to be re-reserved
-- only the uncached tail contributes actual prefill compute
+The current `nano_vllm` micromamba environment was exported to:
 
-So the old scheduler was prefix-cache-aware only after allocation had already happened.
+- `environment.nano_vllm.yml`
 
-### Main Design Change
-Added an explicit prefill planning phase in `BlockManager`.
+To recreate:
 
-#### New structures
-Introduced:
-- `PlanStepKind`
-- `PlanStep`
-- `PrefillPlan`
-
-These describe how each logical prompt block should be handled during prefill allocation.
-
-#### `BlockManager.make_prefill_plan(seq)`
-This new method performs a dry-run prefix match and returns a `PrefillPlan` containing:
-- `steps`: one step per logical block
-- `cached_tokens`: how many prompt tokens are already reusable from prefix cache
-- `required_free_blocks`: how many blocks still need to come out of the allocator free pool
-
-The plan distinguishes three cases:
-- `HIT_USED`: matching cached block is already pinned by another active request, so only `incref()` is needed
-- `HIT_FREE`: matching cached block exists but is currently free, so it must be re-reserved from the free list
-- `MISS`: no reusable block is available, so a new free block must be allocated
-
-### Scheduler Change
-`Scheduler.schedule()` now does this in prefill mode:
-1. build a `PrefillPlan` first
-2. compute `uncached_tokens = len(seq) - plan.cached_tokens`
-3. check `max_num_batched_tokens` using `uncached_tokens`
-4. check block capacity using `plan.required_free_blocks`
-5. only then call `block_manager.allocate(seq, plan)`
-
-This means prefix reuse now influences admission decisions before allocation happens.
-
-### Why `required_free_blocks` Is Not Just Tail Miss Count
-A subtle but important detail:
-- if a cached block is currently free, it still needs to be taken out of `free_block_ids` again before reuse
-- if a cached block is currently in use, reuse only requires `incref()` and consumes no new free slot
-
-So the true capacity cost is:
-- misses
-- plus cached-hit blocks that are currently free
-
-This is why the plan tracks `HIT_USED` vs `HIT_FREE` separately.
-
-### Why This Step Matters
-This is the first step where prefix caching begins to affect the system at the scheduling level, not only at execution time.
-
-Previously, prefix cache reduced compute after a request was admitted.
-Now, prefix cache also helps determine whether the request should be admitted into the prefill batch in the first place.
-
-This is an important bridge toward more advanced radix-style scheduling because it introduces a clean "match first, allocate second" workflow.
-
-### Behavior Preservation Notes
-This step still intentionally preserves the current reuse semantics:
-- only full blocks are reusable
-- once a miss happens, later blocks in the same request are not considered cache hits
-- decode append logic is unchanged
-- the external `BlockManager` API still exists
-
-So this is still an incremental step, not yet a radix-tree implementation.
-
-### Validation After Phase 3
-Re-ran the shared-prefix small regression test.
-Observed log:
-- `logs/experiments/prefix_cache_test_small_20260325_232020.log`
-
-Observed stats:
-
-```text
-[prefix-cache] alloc_reqs=4 dealloc_reqs=4 queried_blocks=16 hit_blocks=9 miss_blocks=7 hit_rate=56.25% reused_tokens=2304 new_blocks=7
+```bash
+micromamba env create -f environment.nano_vllm.yml
 ```
 
-This matched the previous expected behavior exactly, confirming that the scheduling refactor preserved correctness for the current block-level cache model.
+## Quick Start
 
-### What Was Learned From Phase 3
-1. Prefix matching and physical allocation can now be reasoned about as two separate phases.
-2. Free-block pressure depends on more than just cache misses; reusing a currently free cached block still consumes allocator capacity.
-3. The project now has the right control-flow shape for later radix-style evolution: match first, then allocate.
+Activate environment:
 
-### Recommended Next Step
-Phase 4 should improve the prefix index itself, most likely by evolving `PrefixCache` beyond the current chained-hash lookup into a structure that is easier to extend toward radix-tree-style prefix matching.
-
-
-## Phase 4 - Evolve PrefixCache Into a Block-Level Prefix Tree
-
-### Objective
-Replace the current flat chained-hash prefix index with a tree-shaped block-prefix structure, while preserving the current block-level reuse semantics and the Phase 3 scheduling flow.
-
-### File Changed
-- `nanovllm/engine/block_manager.py`
-
-### Problem Before This Step
-After Phase 3, the scheduler already used a prefix-aware planning step, but the prefix index itself was still logically flat:
-- prefix lookup still depended on chained hash lookup
-- future extension toward radix-style structure was not yet represented directly in the data structure
-
-So the control flow had become "match first, allocate second", but the prefix cache itself had not yet become tree-shaped.
-
-### Main Design Change
-Introduced a block-level prefix tree inside `PrefixCache`.
-
-#### New structure
-Added `PrefixTreeNode` with:
-- `block_id`
-- `block_hash`
-- `token_ids`
-- `children`
-
-The cache now has a root node and stores full-block prefixes by walking parent -> child edges keyed by full block token tuples.
-
-### How Lookup Works Now
-For each full prompt block:
-- start from the current prefix node
-- use the block token tuple as the child key
-- if that child exists, the corresponding cached block can be considered for reuse
-- if it does not exist, the prefix path ends there
-
-This makes the logical prefix structure explicit rather than implicit in a flat hash dictionary.
-
-### How Commit Works Now
-When a block becomes committable:
-- find or create the child node under the current prefix node
-- update that node with the latest `block_id` and `block_hash`
-- store the block tokens on the node
-- keep the old `hash_to_block_id` flat mapping as a compatibility/debugging view
-
-So after this step:
-- the tree is the source of truth for prefix traversal
-- the flat hash map is retained as a compatibility mirror
-
-### Why This Matters
-This is the first step where the prefix cache data structure itself becomes structurally closer to a radix-style cache.
-
-It is still block-granular and not yet a full SGLang-style radix tree, but it changes the representation from:
-- flat mapping over chained hashes
-
-to:
-- explicit prefix path over block tokens
-
-That makes later work easier in several ways:
-- longest-prefix-style traversal becomes more natural
-- prefix state is now attached to a path, not just a flat key
-- future node-level policies such as eviction metadata or subtree statistics become easier to add
-
-### Important Constraint
-This phase still intentionally preserves current semantics:
-- only full blocks enter the tree
-- partial tail blocks are still not reusable
-- once a miss occurs inside a request, later blocks are still treated as misses for the current implementation path
-- scheduler interface and prefill plan interface stay unchanged
-
-So this is still an intermediate architectural step, not yet full radix attention.
-
-### Validation After Phase 4
-Ran the shared-prefix small regression test.
-Observed log:
-- `logs/experiments/prefix_cache_test_small_20260326_172607.log`
-
-Observed stats:
-
-```text
-[prefix-cache] alloc_reqs=4 dealloc_reqs=4 queried_blocks=16 hit_blocks=9 miss_blocks=7 hit_rate=56.25% reused_tokens=2304 new_blocks=7
+```bash
+cd /share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix
+./enter_nano_vllm_env.sh
 ```
 
-This matched the previous expected result exactly, showing that the tree-based prefix cache preserves the existing block-level behavior.
+Run the small synthetic prefix-cache test:
 
-### What Was Learned From Phase 4
-1. The control flow and the prefix data structure are now aligned: both are prefix-aware.
-2. The cache has moved from an implicit prefix representation to an explicit path representation.
-3. The project is now materially closer to radix-style evolution, even though the granularity is still full block rather than arbitrary token spans.
-
-### Recommended Next Step
-Phase 5 should decide whether to continue in one of two directions:
-- enhance the tree with richer node metadata and eventual eviction/pinning policy
-- reduce the logical reuse granularity beyond full blocks, which would require a more substantial change to addressing and cache representation
-
-
-## Phase 5 - Make The Prefix Tree Ownership-Safe
-
-### Objective
-Make the block-level prefix tree safer to maintain by ensuring each physical `block_id` has a single authoritative owner node in the tree, and by pruning stale subtrees when a block is reused for a different prefix path.
-
-### File Changed
-- `nanovllm/engine/block_manager.py`
-
-### Problem Before This Step
-After Phase 4, the cache had an explicit tree structure, but it still had a correctness/maintenance risk:
-- when a free block was later reused for a different prefix path
-- the old tree node could still keep pointing to that same `block_id`
-- deeper descendants under that stale node could remain in the tree even though the path was no longer valid
-
-The runtime lookup was still guarded by token equality checks, so many stale cases would degrade into cache misses rather than silent wrong reuse.
-However, the tree would gradually accumulate outdated ownership relationships, making future eviction or policy logic harder and less trustworthy.
-
-### Main Design Change
-Added ownership and maintenance metadata to `PrefixTreeNode` and `PrefixCache`.
-
-#### New node metadata
-`PrefixTreeNode` now records:
-- `parent`
-- `key_from_parent`
-- `depth`
-- `touch_count`
-- `last_access_tick`
-
-This turns the tree into a structure with explicit parent/child identity and access history, rather than only forward child edges.
-
-#### New cache metadata
-`PrefixCache` now tracks:
-- `block_to_node`: reverse mapping from physical `block_id` to its owning tree node
-- `access_tick`: monotonic counter for node touch history
-
-### New Safety Rule
-A physical cache block may only have **one** authoritative owner node in the prefix tree at a time.
-
-When `commit()` assigns a block to a node:
-- look up whether that block id already belongs to another node
-- if so, and it is not the same node, prune the old subtree first
-- then bind the block to the new node
-
-This guarantees that the tree does not keep multiple conflicting prefix paths attached to the same physical block id.
-
-### Subtree Pruning
-Added `_prune_subtree()` which recursively:
-- removes descendant ownership information
-- removes flat hash mirror entries when they still point to the stale node
-- removes reverse block ownership entries
-- detaches the subtree from its parent
-
-This is important because if an internal block in a prefix path becomes invalid, the descendants under that path are no longer semantically usable either.
-
-### Why This Matters
-This phase does not change current hit-rate semantics, but it makes the tree structurally trustworthy for later work.
-
-Without this step, later features such as:
-- node-level eviction metadata
-- subtree-based policies
-- radix-style maintenance logic
-would be built on top of a tree that can retain stale ownership history.
-
-After this step, the prefix tree is no longer just explicit; it is also ownership-safe.
-
-### Additional Benefit
-The new metadata also gives the project a place to hang future policies:
-- `touch_count` and `last_access_tick` can later support cache retention / recency heuristics
-- `parent` and `depth` make subtree operations and ancestor-aware policies easier
-
-### Validation After Phase 5
-Re-ran the shared-prefix small regression test.
-Observed log:
-- `logs/experiments/prefix_cache_test_small_20260326_190538.log`
-
-Observed stats:
-
-```text
-[prefix-cache] alloc_reqs=4 dealloc_reqs=4 queried_blocks=16 hit_blocks=9 miss_blocks=7 hit_rate=56.25% reused_tokens=2304 new_blocks=7
+```bash
+./run_prefix_cache_test_small.sh
 ```
 
-This matched the expected block-level behavior exactly, confirming that ownership-safe tree maintenance did not change the current reuse semantics.
+Run the larger synthetic prefix-cache test:
 
-### What Was Learned From Phase 5
-1. Explicit prefix structure is not enough; ownership consistency also matters.
-2. Guarding correctness only at lookup time is not sufficient if the goal is to evolve the cache into a richer tree-managed system.
-3. Reverse ownership and subtree pruning are natural prerequisites for later eviction or retention policy work.
+```bash
+./run_prefix_cache_test.sh
+```
 
-### Recommended Next Step
-Phase 6 should choose between two directions:
-- add an actual node-level retention / eviction policy using the metadata added in Phase 5
-- start attacking the bigger architectural gap: reuse granularity finer than full blocks
+Run directed page-aware checks:
+
+```bash
+./run_page_aware_prefill_checks.sh
+```
+
+Run the original-vs-radix comparison:
+
+```bash
+./run_nano_radix_prefix_comparison.sh --enforce-eager --gpu-id 1 --max-model-len 800 --max-num-batched-tokens 800 --max-num-seqs 8 --gpu-memory-utilization 0.95
+```
+
+## Comparison Results
+
+Latest completed comparison:
+
+- `exp/logs/nano_radix_prefix_comparison/20260406_202424/summary.md`
+- `logs/experiments/nano_radix_prefix_comparison_20260406_202424/summary.md`
+
+Summary:
+
+| Workload | Original latency (s) | Radix latency (s) | Original cached tokens | Radix cached tokens |
+| --- | ---: | ---: | ---: | ---: |
+| `unique_long_cold` | `27.4772` | `27.5612` | `0` | `0` |
+| `aligned_shared_prefix_warm` | `19.2428` | `17.4658` | `768` | `768` |
+| `nonaligned_shared_prefix_warm` | `18.5552` | `18.7836` | `512` | `600` |
+
+Interpretation:
+
+- On block-aligned shared prefixes, both branches reuse the same amount.
+- On nonaligned shared prefixes, `nano-vllm-radix` shows the intended advantage by
+  reusing the partial tail prefix.
+
+That last row is the key result of this branch.
+
+## Logs and Detailed Records
+
+The root `README.md` is a high-level entry point. Full implementation history lives in:
+
+- `logs/20260325_radix_migration_log.md`
+- `logs/20260323_nano_vllm_radix_qwen_fix.md`
+
+These files contain:
+
+- phased migration notes
+- design rationale
+- bug investigations
+- validation results
+- benchmark debugging history
+
+## Current Limitations
+
+This branch is ahead of the original project, but it is not the final form of a full
+SGLang-style radix cache.
+
+Still missing or incomplete:
+
+- more general token/page-level tree indexing
+- broader non-tail partial matching
+- a true physical page allocator
+- deeper attention/backend integration beyond the current block-based storage model
+- more policy work on copy-on-write overhead and cache retention under load
+
+## Takeaway
+
+This project already demonstrates a concrete and measurable benefit over original
+`nano-vllm`:
+
+- original branch: full-block shared-prefix reuse
+- current branch: full-block reuse plus finer-grained partial-tail reuse
+
+The branch therefore already validates the core migration hypothesis:
+
+SGLang-style radix/prefix reuse ideas can be integrated into the `nano-vllm` framework
+incrementally, and they produce a real cross-request KV reuse advantage before a full
+page/token-level cache redesign is complete.

@@ -1,0 +1,81 @@
+{
+  "backend_name": "radix",
+  "repo_root": "/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix",
+  "model": "/share/home/wangzixu/liudinghao/gushuo/proj/transfoemer-llm/model/Qwen3-0.6B",
+  "workloads": [
+    {
+      "name": "unique_long_cold",
+      "description": "Long unique prompts with no shared prefix. Used as baseline.",
+      "status": "failed",
+      "error_type": "device_side_assert",
+      "error_stage": "prefill_store_kvcache",
+      "error_summary": "Radix backend hit a Triton/CUDA device-side assert in store_kvcache on the unique_long_cold baseline workload.",
+      "requests": 4,
+      "prompt_tokens_total": 2408
+    },
+    {
+      "name": "aligned_shared_prefix_warm",
+      "description": "Warm one retained prompt with 768 shared-prefix tokens, then benchmark aligned shared-prefix reuse.",
+      "status": "success",
+      "bench_latency_s": 17.811586037278175,
+      "requests": 1,
+      "prompt_tokens_total": 770,
+      "completion_tokens_total": 4,
+      "completion_tokens_mean": 4,
+      "cached_tokens_total": 768,
+      "cached_tokens_per_request": [
+        768
+      ],
+      "cached_requests": 1,
+      "stats": {
+        "alloc_requests": 1,
+        "dealloc_requests": 1,
+        "queried_blocks": 4,
+        "hit_blocks": 3,
+        "miss_blocks": 1,
+        "reused_tokens": 768,
+        "partial_reused_tokens": 0,
+        "reused_logical_pages": 24,
+        "prefill_cached_pages": 24,
+        "prefill_uncached_pages": 1,
+        "new_blocks": 1,
+        "eviction_passes": 0,
+        "evicted_leaves": 0,
+        "hit_rate": 0.75,
+        "logical_page_size": 32
+      }
+    },
+    {
+      "name": "nonaligned_shared_prefix_warm",
+      "description": "Warm one retained prompt with 600 shared-prefix tokens, then benchmark nonaligned shared-prefix reuse.",
+      "status": "success",
+      "bench_latency_s": 17.619806118309498,
+      "requests": 1,
+      "prompt_tokens_total": 602,
+      "completion_tokens_total": 4,
+      "completion_tokens_mean": 4,
+      "cached_tokens_total": 600,
+      "cached_tokens_per_request": [
+        600
+      ],
+      "cached_requests": 1,
+      "stats": {
+        "alloc_requests": 1,
+        "dealloc_requests": 1,
+        "queried_blocks": 3,
+        "hit_blocks": 2,
+        "miss_blocks": 0,
+        "reused_tokens": 600,
+        "partial_reused_tokens": 88,
+        "reused_logical_pages": 18,
+        "prefill_cached_pages": 18,
+        "prefill_uncached_pages": 1,
+        "new_blocks": 0,
+        "eviction_passes": 0,
+        "evicted_leaves": 0,
+        "hit_rate": 0.6666666666666666,
+        "logical_page_size": 32
+      }
+    }
+  ]
+}

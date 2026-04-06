@@ -1,0 +1,10 @@
+{
+  "timestamp": "20260406_190000",
+  "driver": "/share/home/wangzixu/liudinghao/gushuo/proj/exp/run_nano_radix_prefix_comparison.py",
+  "mode": "manual_partial_finalize",
+  "notes": [
+    "Original backend JSON was copied from the latest successful driver directory 20260406_184122.",
+    "Radix shared-prefix workloads were rerun as isolated backend processes after fixing prompt tail seed collisions.",
+    "Radix unique_long_cold was recorded as a reproducible backend failure due to a store_kvcache device-side assert."
+  ]
+}

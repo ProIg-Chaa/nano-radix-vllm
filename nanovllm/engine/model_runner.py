@@ -76,6 +76,22 @@ def build_page_aware_prefill_slot_mapping(
     return slot_mapping
 
 
+def covered_page_count(spans: list[LogicalPageSpan]) -> int:
+    if not spans:
+        return 0
+    intervals = sorted((span.start_page, span.end_page) for span in spans)
+    covered = 0
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+            continue
+        covered += cur_end - cur_start
+        cur_start, cur_end = start, end
+    covered += cur_end - cur_start
+    return covered
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -210,9 +226,8 @@ class ModelRunner:
                     span.slot_end - span.slot_start for span in layout.uncached_physical_spans
                 )
                 copied_tokens = sum(span.num_tokens for span in layout.copy_spans)
-                total_span_pages = sum(
-                    span.end_page - span.start_page
-                    for span in layout.cached_page_spans + layout.uncached_page_spans
+                total_span_pages = covered_page_count(
+                    layout.cached_page_spans + layout.uncached_page_spans
                 )
                 assert total_span_pages == seq.num_logical_pages
                 assert cached_page_tokens == seq.num_cached_tokens
@@ -220,20 +235,34 @@ class ModelRunner:
                 assert layout.uncached_start_token == seq.num_cached_tokens
                 assert layout.uncached_end_token == len(seq)
                 assert layout.uncached_num_tokens == len(seq) - seq.num_cached_tokens
-                assert layout.uncached_start_page == seq.num_cached_logical_pages
-                assert layout.uncached_num_pages == seq.num_logical_pages - seq.num_cached_logical_pages
+                expected_uncached_start_page = (
+                    layout.uncached_page_spans[0].start_page
+                    if layout.uncached_page_spans
+                    else seq.num_logical_pages
+                )
+                expected_uncached_num_pages = covered_page_count(layout.uncached_page_spans)
+                assert layout.uncached_start_page == expected_uncached_start_page
+                assert layout.uncached_num_pages == expected_uncached_num_pages
                 assert cached_physical_tokens == cached_page_tokens
                 assert uncached_physical_tokens == uncached_page_tokens
                 assert copied_tokens <= cached_physical_tokens
                 if layout.cached_page_spans:
                     assert len(layout.cached_page_spans) == 1
                     assert layout.cached_page_spans[0].start_page == 0
+                    assert layout.cached_page_spans[0].end_page == (
+                        seq.num_cached_tokens + seq.logical_page_size - 1
+                    ) // seq.logical_page_size
                 if layout.cached_physical_spans:
                     assert layout.cached_physical_spans[0].start_page == 0
                     assert layout.cached_physical_spans[-1].end_token == seq.num_cached_tokens
                 if layout.uncached_physical_spans:
                     assert layout.uncached_physical_spans[0].start_token == layout.uncached_start_token
                     assert layout.uncached_physical_spans[-1].end_token == len(seq)
+                if layout.cached_page_spans and layout.uncached_page_spans:
+                    assert layout.uncached_page_spans[0].start_page in {
+                        layout.cached_page_spans[0].end_page,
+                        layout.cached_page_spans[0].end_page - 1,
+                    }
                 for copy_span in layout.copy_spans:
                     assert copy_span.num_tokens == copy_span.end_token - copy_span.start_token
                     assert 0 <= copy_span.src_block_offset < self.block_size

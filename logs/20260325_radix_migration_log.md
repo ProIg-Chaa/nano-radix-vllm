@@ -1188,3 +1188,80 @@ What is still missing:
 - more general non-tail partial matching
 - page/token-level tree indexing beyond the current last-block path
 - broader policy/overhead tuning for copy-on-write under load
+
+## 2026-04-06 Experiment Finalization and Benchmark Completion
+
+### Goal
+Run a direct comparison between:
+- original `nano-vllm`
+- current `nano-vllm-radix`
+
+with outputs duplicated to:
+- `/share/home/wangzixu/liudinghao/gushuo/proj/exp`
+- `/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/logs/experiments`
+
+### Experiment Workloads
+- `unique_long_cold`
+- `aligned_shared_prefix_warm`
+- `nonaligned_shared_prefix_warm`
+
+### Additional Bug Found During Benchmarking
+The first completed comparison attempts showed a device-side assert on the radix-side
+`unique_long_cold` baseline. This turned out **not** to be a radix prefix-cache bug.
+
+Root cause:
+- the benchmark driver reused `seed_offset=100` for benchmark prompt construction
+- for the `unique` workload this changed prompt token IDs from the valid range
+  (`1000`, `11000`, `21000`, ...)
+  to much larger invalid values (`1001000`, ...)
+- those invalid token IDs triggered embedding/indexing failures inside the model forward
+
+Fix:
+- keep `seed_offset` for shared-prefix warm/bench separation
+- do **not** apply that offset to `unique` prompts
+
+### Additional Driver Stability Change
+The comparison driver was also updated so that each workload runs in its own backend
+process instead of reusing a single backend process across all workloads. This avoids
+cross-workload runtime state contamination and matches the isolated backend tests that
+had already been validated manually.
+
+### Final Comparison Artifacts
+Final successful experiment directory:
+- `/share/home/wangzixu/liudinghao/gushuo/proj/exp/logs/nano_radix_prefix_comparison/20260406_202424`
+- `/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/logs/experiments/nano_radix_prefix_comparison_20260406_202424`
+
+Key files:
+- `summary.json`
+- `summary.md`
+- `original_backend.json`
+- `radix_backend.json`
+
+### Final Results
+`unique_long_cold`
+- original latency: `27.4772 s`
+- radix latency: `27.5612 s`
+- original cached tokens: `0`
+- radix cached tokens: `0`
+
+`aligned_shared_prefix_warm`
+- original latency: `19.2428 s`
+- radix latency: `17.4658 s`
+- original cached tokens: `768`
+- radix cached tokens: `768`
+
+`nonaligned_shared_prefix_warm`
+- original latency: `18.5552 s`
+- radix latency: `18.7836 s`
+- original cached tokens: `512`
+- radix cached tokens: `600`
+- radix extra reused prefix: `+88 tokens`
+
+### Interpretation
+The benchmark now clearly demonstrates the intended qualitative behavior:
+
+- For block-aligned shared prefixes, the radix branch does not change the reuse amount.
+- For nonaligned shared prefixes, the radix branch reuses the partial tail prefix while
+  the original branch stops at the last full block.
+- The current radix branch therefore already demonstrates a concrete finer-grained reuse
+  advantage over original `nano-vllm`.

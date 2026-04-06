@@ -1,0 +1,53 @@
+{
+  "timestamp": "20260406_190000",
+  "model": "/share/home/wangzixu/liudinghao/gushuo/proj/transfoemer-llm/model/Qwen3-0.6B",
+  "original_repo": "/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm",
+  "radix_repo": "/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix",
+  "notes": [
+    "The experiment successfully completed on the two shared-prefix workloads that differentiate block-level reuse from finer-grained reuse.",
+    "The radix backend failed on unique_long_cold with a Triton/CUDA device-side assert in store_kvcache, so that workload is recorded as a backend failure rather than a latency datapoint.",
+    "Warm and benchmark prompts use different tail tokens so the comparison measures prefix reuse instead of full prompt identity."
+  ],
+  "workloads": [
+    {
+      "name": "unique_long_cold",
+      "original": {
+        "status": "success",
+        "bench_latency_s": 27.94011866301298,
+        "cached_tokens_total": 0
+      },
+      "radix": {
+        "status": "failed",
+        "bench_latency_s": null,
+        "cached_tokens_total": null,
+        "error_summary": "device-side assert in store_kvcache during unique baseline prefill"
+      }
+    },
+    {
+      "name": "aligned_shared_prefix_warm",
+      "original": {
+        "status": "success",
+        "bench_latency_s": 17.957893665879965,
+        "cached_tokens_total": 768
+      },
+      "radix": {
+        "status": "success",
+        "bench_latency_s": 17.811586037278175,
+        "cached_tokens_total": 768
+      }
+    },
+    {
+      "name": "nonaligned_shared_prefix_warm",
+      "original": {
+        "status": "success",
+        "bench_latency_s": 17.856412831693888,
+        "cached_tokens_total": 512
+      },
+      "radix": {
+        "status": "success",
+        "bench_latency_s": 17.619806118309498,
+        "cached_tokens_total": 600
+      }
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "timestamp": "20260406_202424",
+  "driver": "/share/home/wangzixu/liudinghao/gushuo/proj/exp/run_nano_radix_prefix_comparison.py",
+  "python": "/share/home/wangzixu/.local/share/mamba/envs/nano_vllm/bin/python",
+  "workloads": [
+    {
+      "name": "unique_long_cold",
+      "description": "Long unique prompts with no shared prefix. Used as baseline.",
+      "warm_kind": "none",
+      "bench_kind": "unique",
+      "warm_count": 0,
+      "bench_count": 4,
+      "shared_prefix_tokens": 0,
+      "tail_tokens": 2,
+      "max_tokens": 4
+    },
+    {
+      "name": "aligned_shared_prefix_warm",
+      "description": "Warm one retained prompt with 768 shared-prefix tokens, then benchmark aligned shared-prefix reuse.",
+      "warm_kind": "aligned_shared",
+      "bench_kind": "aligned_shared",
+      "warm_count": 1,
+      "bench_count": 1,
+      "shared_prefix_tokens": 768,
+      "tail_tokens": 2,
+      "max_tokens": 4
+    },
+    {
+      "name": "nonaligned_shared_prefix_warm",
+      "description": "Warm one retained prompt with 600 shared-prefix tokens, then benchmark nonaligned shared-prefix reuse.",
+      "warm_kind": "nonaligned_shared",
+      "bench_kind": "nonaligned_shared",
+      "warm_count": 1,
+      "bench_count": 1,
+      "shared_prefix_tokens": 600,
+      "tail_tokens": 2,
+      "max_tokens": 4
+    }
+  ],
+  "args": {
+    "mode": "driver",
+    "backend_name": null,
+    "repo_root": null,
+    "model": "/share/home/wangzixu/liudinghao/gushuo/proj/transfoemer-llm/model/Qwen3-0.6B",
+    "gpu_id": "1",
+    "max_model_len": 800,
+    "max_num_batched_tokens": 800,
+    "max_num_seqs": 8,
+    "gpu_memory_utilization": 0.95,
+    "tensor_parallel_size": 1,
+    "enforce_eager": true,
+    "logical_page_size": 32,
+    "kvcache_block_size": 256,
+    "timestamp": null,
+    "workload_name": null
+  }
+}

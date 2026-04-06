@@ -459,17 +459,18 @@ class BlockManager:
             cached_in_page == self.logical_page_size
             for cached_in_page in page_cached_tokens
         )
-        required_logical_pages = seq.num_logical_pages - (cached_tokens // self.logical_page_size)
         assert len(page_block_ids) == seq.num_logical_pages
         assert len(cached_page_mask) == seq.num_logical_pages
         assert len(page_cached_tokens) == seq.num_logical_pages
         cached_page_spans, uncached_page_spans = self.build_page_spans(cached_tokens, len(seq), seq.num_logical_pages)
         uncached_start_token = cached_tokens
-        uncached_start_page = cached_tokens // self.logical_page_size
+        uncached_start_page = (
+            uncached_page_spans[0].start_page if uncached_page_spans else seq.num_logical_pages
+        )
         uncached_num_tokens = len(seq) - uncached_start_token
-        uncached_num_pages = seq.num_logical_pages - uncached_start_page
+        uncached_num_pages = sum(span.end_page - span.start_page for span in uncached_page_spans)
+        required_logical_pages = uncached_num_pages
         assert uncached_start_token == cached_tokens
-        assert uncached_num_pages == required_logical_pages
         return PrefillPlan(
             steps,
             cached_tokens,
