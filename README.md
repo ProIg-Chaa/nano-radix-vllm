@@ -1,7 +1,8 @@
 # nano-vllm-radix
 
-`nano-vllm-radix` is an experimental branch of `nano-vllm` that incrementally integrates
-SGLang-style radix/prefix reuse ideas into the original lightweight inference framework.
+`nano-vllm-radix` is an independent repository derived from `nano-vllm` that
+incrementally integrates SGLang-style radix/prefix reuse ideas into the original
+lightweight inference framework.
 
 The project goal is:
 
@@ -12,6 +13,26 @@ The project goal is:
 
 This repository is not a verbatim port of SGLang. It is a staged migration that reuses
 the `nano-vllm` codebase and evolves it toward a more prefix-aware cache manager.
+
+## Attribution and License
+
+This project is derived from:
+
+- `nano-vllm`
+- upstream copyright: `Copyright (c) 2025 Xingkai Yu`
+- upstream license: MIT
+
+This repository keeps the upstream MIT license in [LICENSE](/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/LICENSE)
+and adds project-level attribution in [NOTICE](/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/NOTICE).
+
+The current repository contains substantial modifications and new components for:
+
+- radix/prefix reuse integration
+- prefix-aware scheduling
+- logical-page-aware prefill preparation
+- partial-tail reuse
+- active partial-tail copy-on-write reuse
+- benchmarking and experiment tooling
 
 ## Current Status
 

@@ -1,0 +1,20 @@
+This repository is derived from nano-vllm.
+
+Upstream project:
+- nano-vllm
+- Copyright (c) 2025 Xingkai Yu
+- Licensed under the MIT License
+
+This repository preserves the upstream MIT license and contains substantial
+modifications and new components for:
+- radix/prefix reuse integration
+- prefix-aware scheduling
+- logical-page-aware prefill preparation
+- partial-tail KV reuse
+- active partial-tail copy-on-write reuse
+- comparison benchmarking and experiment tooling
+
+When redistributing this project, retain:
+- the upstream MIT LICENSE
+- this NOTICE file
+- any additional attribution documentation included with the repository
