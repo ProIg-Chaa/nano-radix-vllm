@@ -1,5 +1,7 @@
 # nano-vllm-radix
 
+Language: English | [中文](./README.zh-CN.md)
+
 `nano-vllm-radix` is an independent repository derived from `nano-vllm` that
 incrementally integrates SGLang-style radix/prefix reuse ideas into the original
 lightweight inference framework.
@@ -22,8 +24,8 @@ This project is derived from:
 - upstream copyright: `Copyright (c) 2025 Xingkai Yu`
 - upstream license: MIT
 
-This repository keeps the upstream MIT license in [LICENSE](/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/LICENSE)
-and adds project-level attribution in [NOTICE](/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/NOTICE).
+This repository keeps the upstream MIT license in [LICENSE](./LICENSE)
+and adds project-level attribution in [NOTICE](./NOTICE).
 
 The current repository contains substantial modifications and new components for:
 
@@ -209,7 +211,7 @@ micromamba env create -f environment.nano_vllm.yml
 Activate environment:
 
 ```bash
-cd /share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix
+cd .
 ./enter_nano_vllm_env.sh
 ```
 
@@ -237,6 +239,18 @@ Run the original-vs-radix comparison:
 ./run_nano_radix_prefix_comparison.sh --enforce-eager --gpu-id 1 --max-model-len 800 --max-num-batched-tokens 800 --max-num-seqs 8 --gpu-memory-utilization 0.95
 ```
 
+Run the system benchmark extension (single GPU):
+
+```bash
+./run_nano_radix_system_benchmarks.sh --enforce-eager --gpu-id 1
+```
+
+Run the same system benchmark with multi-GPU TP=2:
+
+```bash
+./run_nano_radix_system_benchmarks.sh --enforce-eager --gpu-id 0,1 --tensor-parallel-size 2
+```
+
 ## Comparison Results
 
 Latest completed comparison:
@@ -257,6 +271,42 @@ Interpretation:
 - On block-aligned shared prefixes, both branches reuse the same amount.
 - On nonaligned shared prefixes, `nano-vllm-radix` shows the intended advantage by
   reusing the partial tail prefix.
+
+## System Benchmark Results (New)
+
+### Single GPU run
+
+Artifacts:
+
+- `exp/logs/nano_radix_system_benchmarks/20260409_201746/summary.md`
+- `logs/experiments/nano_radix_system_benchmarks_20260409_201746/summary.md`
+
+Key findings:
+
+- Throughput-vs-concurrency on warmed nonaligned shared prefixes shows clear radix gains
+  at several concurrency levels, especially `2/8/16`.
+- Prefix-overlap sweep shows the expected differentiation at `100%` overlap:
+  original cached tokens `8192` vs radix cached tokens `8368`.
+- Long-context stress (`1k/2k/4k/8k`) remains stable on both branches, with similar KV
+  block growth and memory behavior.
+
+### Multi-GPU run (`GPU 0,1`, `tensor_parallel_size=2`)
+
+Artifacts:
+
+- `exp/logs/nano_radix_system_benchmarks/20260410_132551/summary.md`
+- `logs/experiments/nano_radix_system_benchmarks_20260410_132551/summary.md`
+
+Representative points from throughput-vs-concurrency:
+
+- `concurrency=2`: original `856.2157 tok/s` vs radix `1420.4871 tok/s`
+- `concurrency=8`: original `4065.6286 tok/s` vs radix `5684.3809 tok/s`
+- `concurrency=16`: original `9449.9830 tok/s` vs radix `11267.6553 tok/s`
+
+Corresponding cache behavior remains consistent with the project goal:
+
+- original nonaligned shared-prefix reuse is still bounded by full-block alignment
+- radix branch continues to reuse the partial tail (`cached tokens` advantage remains visible)
 
 That last row is the key result of this branch.
 

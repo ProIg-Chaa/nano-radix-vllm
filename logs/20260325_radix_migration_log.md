@@ -1293,3 +1293,139 @@ gain beyond full-block alignment.
 
 Recommended Git reference:
 - annotated tag: `milestone-20260406-finer-grained-prefix-reuse`
+
+## 2026-04-09 System Benchmark Extension
+
+### Goal
+Extend the original point benchmark into three more engineering-style experiment
+families:
+- throughput vs concurrency
+- prefix overlap ratio sweep
+- long-context stress
+
+### Artifacts
+Final successful experiment directory:
+- `/share/home/wangzixu/liudinghao/gushuo/proj/exp/logs/nano_radix_system_benchmarks/20260409_201746`
+- `/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/logs/experiments/nano_radix_system_benchmarks_20260409_201746`
+
+Key files:
+- `summary.json`
+- `summary.md`
+- `original_backend.json`
+- `radix_backend.json`
+
+### Driver
+New system benchmark driver:
+- `/share/home/wangzixu/liudinghao/gushuo/proj/exp/run_nano_radix_system_benchmarks.py`
+- wrapper: `/share/home/wangzixu/liudinghao/gushuo/proj/nano-vllm-radix/run_nano_radix_system_benchmarks.sh`
+
+The driver runs each case in an isolated backend subprocess and mirrors the final
+artifacts into both the general experiment directory and the radix repository
+experiment directory.
+
+### Experiment Design
+1. Throughput vs concurrency
+- concurrency: `1 / 2 / 4 / 8 / 16`
+- warmed nonaligned shared prefix: `600` tokens
+- prompt length: `608`
+- completion length: `8`
+
+2. Prefix overlap ratio
+- overlap ratio: `0 / 25 / 50 / 75 / 100`
+- reusable region: `1200` tokens
+- fixed unique tail: `8` tokens
+- concurrency fixed at `8`
+
+3. Long-context stress
+- context length: `1024 / 2048 / 4096 / 8192`
+- single request
+- completion length: `1`
+
+### Reported Metrics
+- end-to-end tokens/s:
+  `(prompt_tokens + completion_tokens) / wall_time`
+- average latency
+- p95 latency
+- token-level cache hit rate:
+  `cached_tokens_total / prompt_tokens_total`
+- KV blocks used in long-context stress
+- GPU memory snapshots after init / after run / peak reserved
+
+### Results
+#### Throughput vs concurrency
+`concurrency=1`
+- original: `34.5128 tok/s`, latency `17.8482 s`, cache hit rate `0.8421`, cached `512`
+- radix: `34.2062 tok/s`, latency `18.0082 s`, cache hit rate `0.9868`, cached `600`
+
+`concurrency=2`
+- original: `963.4194 tok/s`, latency `1.2786 s`, cached `1024`
+- radix: `1555.0364 tok/s`, latency `0.7920 s`, cached `1112`
+
+`concurrency=4`
+- original: `3110.8111 tok/s`, latency `0.7918 s`, cached `2048`
+- radix: `3119.5075 tok/s`, latency `0.7896 s`, cached `2136`
+
+`concurrency=8`
+- original: `4294.4678 tok/s`, latency `1.1472 s`, cached `4096`
+- radix: `6144.6284 tok/s`, latency `0.8016 s`, cached `4184`
+
+`concurrency=16`
+- original: `10260.5833 tok/s`, latency `0.9601 s`, cached `8192`
+- radix: `12100.2731 tok/s`, latency `0.8140 s`, cached `8280`
+
+#### Prefix overlap ratio
+`0%`
+- original: hit rate `0.0000`, `12426.0279 tok/s`, latency `0.7826 s`
+- radix: hit rate `0.0000`, `12094.5047 tok/s`, latency `0.8040 s`
+
+`25%`
+- original: hit rate `0.2119`, cached `2048`
+- radix: hit rate `0.2119`, cached `2048`
+
+`50%`
+- original: hit rate `0.4238`, cached `4096`
+- radix: hit rate `0.4238`, cached `4096`
+
+`75%`
+- original: hit rate `0.6358`, cached `6144`
+- radix: hit rate `0.6358`, cached `6144`
+
+`100%`
+- original: hit rate `0.8477`, cached `8192`
+- radix: hit rate `0.8659`, cached `8368`
+
+#### Long-context stress
+`1024`
+- original: latency `26.9220 s`, `38.0728 tok/s`, `4` KV blocks
+- radix: latency `26.8862 s`, `38.1234 tok/s`, `4` KV blocks
+
+`2048`
+- original: latency `26.6190 s`, `76.9746 tok/s`, `8` KV blocks
+- radix: latency `33.8702 s`, `60.4951 tok/s`, `8` KV blocks
+
+`4096`
+- original: latency `26.7728 s`, `153.0272 tok/s`, `16` KV blocks
+- radix: latency `26.9565 s`, `151.9846 tok/s`, `16` KV blocks
+
+`8192`
+- original: latency `27.1071 s`, `302.2435 tok/s`, `32` KV blocks
+- radix: latency `26.8545 s`, `305.0855 tok/s`, `32` KV blocks
+
+### Interpretation
+- The throughput-vs-concurrency experiment clearly exposes the current radix branch's
+  intended strength on warmed nonaligned shared prefixes. The most visible gains show
+  up at `concurrency=2`, `8`, and `16`.
+- The overlap-ratio sweep shows that the current radix branch only diverges from the
+  original branch once the overlap begins to include the nonaligned tail opportunity.
+  In this design that only becomes visible at the `100%` overlap case, where radix
+  reuses `8368` tokens vs original `8192`.
+- The long-context stress test is primarily a stability/resource experiment. It shows
+  comparable KV block growth and GPU memory usage. It does **not** currently show a
+  systematic radix advantage because these cases do not exercise cross-request shared
+  prefix reuse.
+
+### Practical Takeaway
+The current project now has two layers of evidence:
+- focused point benchmark proving the `512 -> 600` nonaligned reuse gain
+- broader system benchmark showing how that gain appears in concurrency and overlap
+  sweeps while preserving long-context stability
